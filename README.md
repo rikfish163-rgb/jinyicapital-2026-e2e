@@ -4,7 +4,7 @@
 
 **研究原则：满足数据、时序和运行约束后，以比赛的五项指标及样本外表现决定模型是否保留。** 参数量、训练损失和重建误差用于诊断与训练；架构修改需要说明预期改善哪项比赛指标，并通过固定时间切分验证。
 
-> 当前状态：研究设计阶段。README 中的网络、损失和实验均为候选方案，尚无已实现训练管线、已训练模型或实测成绩。规则依据团队收到的赛事说明整理于 2026 年 10 月 7 日，具体字段和评测细节以比赛平台最终说明为准。
+> 当前状态：已有与真实字段解耦的原型模块，包括训练集标准化、GRU 与 patch Transformer、Huber/排序损失及本地研究指标。真实数据适配、完整训练管线、平台推理 Notebook、模型权重和实测成绩尚未完成。规则依据团队收到的赛事说明整理于 2026 年 10 月 7 日，具体字段和评测细节以比赛平台最终说明为准。
 
 ## 1. 题目理解
 
@@ -247,13 +247,13 @@ PatchEncoder 可以是线性投影或小型时间卷积。它从原始序列学�
 
 ### 5.1 从回归和排序开始
 
-第一版使用 Huber 回归官方标签，得到可运行基线。之后加入同一时点股票对的排序目标：
+已实现 Huber 与同一时点股票对的排序损失；完整训练循环需在真实数据适配后完成。排序目标为：
 
 $$
 \mathcal L_{rank}=\operatorname{mean}_{(i,j),t}\log\left(1+\exp[-\operatorname{sign}(y_{i,t}-y_{j,t})(s_{i,t}-s_{j,t})]\right).
 $$
 
-组合损失可试为：
+原型支持的组合损失为：
 
 $$
 \mathcal L=\mathcal L_{Huber}+\alpha\mathcal L_{rank}.
@@ -309,10 +309,10 @@ $$
 
 | 实验 | Tokenizer / Encoder | 训练目标 | 状态 |
 | --- | --- | --- | --- |
-| A0 | 一分钟 token + GRU | Huber | 计划 |
-| A1 | 分组编码 + GRU | Huber | 计划 |
-| A2 | 分组编码 + patch Transformer | Huber | 计划 |
-| A3 | 较优架构 | Huber + 排序 | 计划 |
+| A0 | 一分钟 token + GRU | Huber | 模块已实现，待真实数据实验 |
+| A1 | 分组编码 + GRU | Huber | 模块已实现，待真实数据实验 |
+| A2 | 分组编码 + patch Transformer | Huber | 模块已实现，待真实数据实验 |
+| A3 | 较优架构 | Huber + 排序 | 损失已实现，待真实数据实验 |
 | A4 | 较优架构 | 加稳定性或换手近似 | 计划 |
 
 每次只改变一个主要因素，记录：数据版本、日期切分、字段顺序、标准化、随机种子、五项原始指标、分场景表现、覆盖率和推理耗时。无真实结果时不填公榜成绩。少量固定随机种子的重复实验用于观察增益是否可靠。
@@ -347,21 +347,31 @@ $$
 - [ ] BARRA 风格剔除与本地评测模块的对应关系。
 - [ ] 输入预处理和编码方案允许范围、最终 CPU/GPU 限制。
 
-## 9. 仓库规划与公开边界
+## 9. 当前代码与公开边界
 
-以下为后续实现建议，不表示文件已经存在：
+已实现的原型结构：
 
 ```text
 README.md
-configs/                 # 字段、模型、训练及推理配置
-src/data/                # 授权数据读取、时间对齐与切窗
-src/models/              # Tokenizer、Encoder、预测头
-src/losses/              # 回归、排序与训练近似目标
-src/evaluation/          # 本地指标与官方评测适配
-scripts/train.py         # 训练入口
-scripts/predict.py       # 推理入口
-submission/predict.ipynb # 最终唯一推理 Notebook
+pyproject.toml
+src/jyc_e2e/contracts.py          # 原始字段分组与时间可见性检查
+src/jyc_e2e/preprocessing.py      # 仅在训练集拟合的标准化器
+src/jyc_e2e/model.py              # 分组编码、GRU、patch Transformer
+src/jyc_e2e/losses.py             # Huber 与同截面排序损失
+src/jyc_e2e/research_metrics.py   # 本地研究指标，不等同官方评测
+examples/forward_demo.py          # 纯模拟数据的前向示例
 ```
+
+取得正式字段字典后，再实现授权数据读取、合法时点生成、标签对齐、按时间切分、训练入口及平台唯一推理 Notebook。`main(datasources, start_date, end_date)` 的取数和输出契约仍以平台模板为准。
+
+在配置了 PyTorch 的环境中，可安装包并运行仅用于检查张量形状的示例。当前工作环境未安装 PyTorch，因此神经网络前向尚未在此机器验证：
+
+```powershell
+python -m pip install -e .
+python examples/forward_demo.py
+```
+
+示例生成随机数值和随机标签，不包含赛事数据，也不代表预测表现。真实数据进入模型前应由数据适配层调用 `validate_sequences` 与 `validate_availability`。后者要求传入**记录实际完成并可见的时间**；原始表中的时间戳若表示区间起点，需先按平台口径转换。
 
 公开仓库用于设计说明及允许公开的代码。受限行情数据、下载链接、学生身份材料、协议、账号凭证和含敏感内容的日志不进入 Git。模型权重是否允许公开需核对数据协议。仓库代码许可证需由团队确定，引用或改造第三方代码时保留其许可与来源。
 
