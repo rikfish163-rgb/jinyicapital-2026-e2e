@@ -1,0 +1,7 @@
+-e .
+numpy==2.2.6
+pandas==2.2.3
+pyarrow==20.0.0
+torch==2.8.0
+pytest==8.4.2
+pyqlib @ git+https://github.com/microsoft/qlib.git@54355232463878d2eebb91fe0ee5fa7fa1f5976c

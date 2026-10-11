@@ -8,8 +8,14 @@ data/
 datasets/
 checkpoints/
 weights/
+model-bundles/
 runs/
 logs/
+work/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
 *.pt
 *.pth
 *.ckpt
