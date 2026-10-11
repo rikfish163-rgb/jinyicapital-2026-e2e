@@ -11,3 +11,9 @@ dependencies = ["numpy>=1.26,<3", "torch>=2.2,<3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "--basetemp=work/pytest-temp"
+cache_dir = "work/pytest-cache"
