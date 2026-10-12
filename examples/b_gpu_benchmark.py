@@ -1,7 +1,6 @@
 """Measure model capacity using repeated real windows, without official scores."""
 
 import argparse
-from dataclasses import replace
 import json
 from pathlib import Path
 import statistics
@@ -32,6 +31,9 @@ def main(argv=None):
     config = json.loads(args.config.read_text(encoding="utf-8"))
     if config.get("scope") != "diagnostic":
         raise ContractError("use explicit real-bar diagnostic config; this does not measure official prediction quality")
+    repository = Path(__file__).resolve().parents[1]
+    if args.output.resolve() == repository or repository in args.output.resolve().parents:
+        raise ContractError("keep real-window benchmark artifacts and cache outside the repository")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     prepared = _prepare(config, output_dir=args.output.parent / "preparation")
     batches = list(prepared.validation_loader())

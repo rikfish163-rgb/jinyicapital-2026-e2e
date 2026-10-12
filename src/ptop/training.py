@@ -183,7 +183,10 @@ def _implementation_contract() -> dict:
     names = ("schema", "data", "windows", "preprocessing", "encoders", "models", "backbones", "temporal",
              "training", "training_config", "objectives", "checkpoint", "local_training")
     directory = Path(__file__).parent
-    return {name: hashlib.sha256((directory / (name + ".py")).read_bytes()).hexdigest() for name in names}
+    result = {name: hashlib.sha256((directory / (name + ".py")).read_bytes()).hexdigest() for name in names}
+    for name in ("losses", "research_metrics"):
+        result["jyc_e2e/" + name] = hashlib.sha256((directory.parent / "jyc_e2e" / (name + ".py")).read_bytes()).hexdigest()
+    return result
 
 
 def _input_contract(prepared) -> dict:
