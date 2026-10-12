@@ -209,7 +209,9 @@ def test_future_input_invalid_labels_missing_batches_and_resume_config_fail(prep
     invalid = replace(prepared, validation_targets=prepared.validation_targets.assign(target_valid=False, target=np.nan))
     with pytest.raises(ContractError, match="no valid supervised"):
         make_trainer(tmp_path / "invalid", mapping, fold).fit(invalid)
-    incomplete = replace(prepared, validation_loader=[batch])
+    from torch.utils.data import DataLoader
+    incomplete = replace(prepared, validation_loader=DataLoader(prepared.validation_loader.dataset,
+                        batch_sampler=[list(range(5))], collate_fn=collate_windows))
     with pytest.raises(ContractError, match="complete declared"):
         make_trainer(tmp_path / "incomplete", mapping, fold).fit(incomplete)
     partial = make_trainer(tmp_path / "mismatch", mapping, fold).fit(prepared, stop_after_epochs=1)

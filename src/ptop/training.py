@@ -179,6 +179,32 @@ def _callable_contract(value) -> dict:
         raise ContractError("C callable configuration must be finite JSON; declare its immutable settings") from error
 
 
+def _implementation_contract() -> dict:
+    names = ("schema", "data", "windows", "preprocessing", "encoders", "models", "backbones", "temporal",
+             "training", "training_config", "objectives", "checkpoint", "local_training")
+    directory = Path(__file__).parent
+    return {name: hashlib.sha256((directory / (name + ".py")).read_bytes()).hexdigest() for name in names}
+
+
+def _input_contract(prepared) -> dict:
+    manifest = getattr(prepared, "manifest", None)
+    if isinstance(manifest, dict) and manifest:
+        return {"manifest_sha256": hashlib.sha256(json.dumps(manifest, sort_keys=True,
+                    ensure_ascii=False, allow_nan=False).encode()).hexdigest()}
+    result = {}
+    for phase in ("train", "validation"):
+        data = getattr(getattr(getattr(prepared, phase + "_loader"), "dataset", None), "data", None)
+        if data is None:
+            raise ContractError("custom prepared factories must declare a source/visibility manifest for resume")
+        digest = hashlib.sha256()
+        for frame in (data.values, data.observed, data.metadata):
+            digest.update(json.dumps([str(name) for name in frame.columns]).encode())
+            for start in range(0, len(frame), 50_000):
+                digest.update(pd.util.hash_pandas_object(frame.iloc[start:start + 50_000], index=True).to_numpy().tobytes())
+        result[phase + "_source_sha256"] = digest.hexdigest()
+    return result
+
+
 def validate_batch(batch: WindowBatch, fields: tuple[str, ...], *, length: int, scope: str) -> np.ndarray:
     if not isinstance(batch, WindowBatch):
         raise ContractError("A data loader must yield WindowBatch")
@@ -487,7 +513,8 @@ class Trainer:
                  "validation_start": self.fold.validation_start.isoformat(), "validation_end": self.fold.validation_end.isoformat(),
                  "train_targets_fingerprint": train_fingerprint, "validation_targets_fingerprint": validation_fingerprint,
                  "scope": self.scope, "objective": objective_config,
-                 "evaluator": _callable_contract(self.evaluator), "target_scale": self.target_scale}
+                 "evaluator": _callable_contract(self.evaluator), "target_scale": self.target_scale,
+                 "implementation": _implementation_contract(), "inputs": _input_contract(prepared)}
         indexed_train, indexed_validation = train.set_index("sample_id", drop=False), validation.set_index("sample_id", drop=False)
         start_epoch = completed = bad_epochs = 0
         best_metric, best_epoch = None, 0
