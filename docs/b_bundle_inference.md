@@ -140,3 +140,9 @@ for result in predict_bundle_partitions(
 
 `tests/test_checkpoint_inference.py` 使用合成、带空股票与真实缺失分钟的官方形状样本，验证旧 v1 与全部四个 B 模型 JSON/torch 往返、文件修改拒绝、配置与依赖检查、完整模型/optimizer/scheduler/CPU AMP/随机状态恢复、下一次训练更新复现、独立 sampler 状态、微批与重排、掩码/键/时序验证、零分回退覆盖门槛、冻结处理器和分区查询惰性。真实官方标签、DAI 平台和 CUDA 的运行证据由比赛训练与部署记录另行提供。
 
+2026-10-12 在 Python 3.12、Torch 2.8.0+cpu、NumPy 2.2.6、Pandas 2.2.3、PyArrow 20.0.0 和固定提交的 Qlib 0.9.8 环境，使用两个 CPU 线程运行以下三套测试：**213 passed，4 skipped**（39.56 秒）。跳过的四项是时序模型显式 opt-in 的 CUDA 测试。九个旧模型均验证 v1 精确权重往返；携带源码还在隔离工作目录的新 Python 进程中加载，确认实际导入 `source/ptop` 和 `source/jyc_e2e` 并复现 Transformer 分数。
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m pytest -q \
+  tests/test_checkpoint_inference.py tests/test_cloud_bridge.py tests/test_temporal.py
+```

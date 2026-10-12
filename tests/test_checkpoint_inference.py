@@ -2,7 +2,10 @@
 
 import copy
 import json
+import os
 import random
+import subprocess
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -101,11 +104,13 @@ def _random_draws():
     return random.random(), float(np.random.random()), torch.rand(3)
 
 
-def test_legacy_bundle_preserves_v1_and_rng(inputs, tmp_path):
+@pytest.mark.parametrize("name", ["R0", "R1", "R1-Book", "Net64", "Net192", "GroupedNet", "Patch1", "Patch5", "DeepLOB"])
+def test_legacy_bundle_preserves_v1_and_rng(inputs, tmp_path, name):
     _, _, processor, _, _, _, mapping, _ = inputs
-    model = create_model("R1").eval()
+    model = create_model(name).eval()
     path = tmp_path / "legacy"
-    _save_bundle(path, model, processor, mapping)
+    save_bundle(path, model, processor, model_name=name, window_length=4, contracts=CONTRACTS, seed=17,
+                training_record={"scope": "synthetic interface tests"}, instrument_map=mapping)
     rng = torch.random.get_rng_state().clone()
     restored, loaded_processor, manifest = load_bundle(path)
     assert manifest["bundle_version"] == 1 and "model_spec" not in manifest
@@ -239,6 +244,46 @@ def test_portable_bundle_uses_fixed_qlib_license_when_wheel_omits_it(inputs, tmp
     assert (path / "licenses/pyqlib/LICENSE").read_bytes() == (path / "source/ptop/licenses/QLIB-MIT.txt").read_bytes()
     assert "fixed-commit repository MIT license" in (path / "THIRD_PARTY.md").read_text()
     load_bundle(path)
+
+
+def test_portable_source_reproduces_scores_in_fresh_interpreter(inputs, tmp_path):
+    _, _, processor, _, _, _, mapping, _ = inputs
+    spec = _spec(name="B-Transformer")
+    model = create_score_model(spec).eval()
+    path = tmp_path / "bundle"
+    _save_bundle(path, model, processor, mapping, spec, weight_format="torch")
+    batch = _batch(inputs)
+    positions = batch.predictable
+    arrays = tmp_path / "inputs.npz"
+    np.savez(arrays, x=batch.x[positions], observed=batch.observed[positions], step_valid=batch.step_valid[positions])
+    scores_file = tmp_path / "scores.npy"
+    script = '''
+import sys
+from pathlib import Path
+import numpy as np
+import torch
+import ptop.bundle
+import jyc_e2e.research_metrics
+import jyc_e2e.losses
+from ptop.bundle import load_bundle
+torch.set_num_threads(2)
+bundle = Path(sys.argv[1])
+assert Path(ptop.bundle.__file__).resolve() == (bundle / 'source/ptop/bundle.py').resolve()
+assert Path(jyc_e2e.losses.__file__).resolve() == (bundle / 'source/jyc_e2e/losses.py').resolve()
+model, processor, manifest = load_bundle(bundle)
+arrays = np.load(sys.argv[2], allow_pickle=False)
+with torch.inference_mode():
+    scores = model(*(torch.as_tensor(arrays[key]) for key in ('x', 'observed', 'step_valid')))
+np.save(sys.argv[3], scores.numpy())
+'''
+    environment = dict(os.environ, PYTHONPATH=str(path / "source"), CUDA_VISIBLE_DEVICES="",
+                       OMP_NUM_THREADS="2", MKL_NUM_THREADS="2")
+    result = subprocess.run([sys.executable, "-c", script, str(path), str(arrays), str(scores_file)],
+                            cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    with torch.inference_mode():
+        expected = model(*(torch.as_tensor(value[positions]) for value in (batch.x, batch.observed, batch.step_valid)))
+    np.testing.assert_allclose(np.load(scores_file), expected.numpy(), atol=2e-6, rtol=2e-6)
 
 
 def _training_update(model, optimizer, scheduler, scaler, batch):
