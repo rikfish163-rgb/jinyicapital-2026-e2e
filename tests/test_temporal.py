@@ -1,12 +1,13 @@
 """Behavioral checks for the A encoder -> B backbone -> score contract."""
 
 import json
+import os
 from dataclasses import replace
 
 import pytest
 import torch
 
-from ptop.backbones import TemporalPool, compact_valid_tokens
+from ptop.backbones import TemporalPool, _SelectiveStateBlock, compact_valid_tokens
 from ptop.bundle import MODEL_NAMES, create_model
 from ptop.encoders import predictable_mask
 from ptop.schema import BOOK12_FIELDS, FEATURES, ContractError
@@ -91,6 +92,19 @@ def test_serialized_spec_rejects_unknown_fields_and_bad_field_types():
     assert spec.fields == ("close", "volume")
 
 
+@pytest.mark.parametrize("encoder", ("Raw", "ALSTM"))
+def test_custom_fields_preserve_raw25_contract_and_ignore_other_fields(encoder):
+    model = create_score_model(modern_spec("B-GRU", encoder=encoder, fields=("close", "volume"))).eval()
+    batch = inputs()
+    changed = batch[0].clone()
+    excluded = [index for index, field in enumerate(FEATURES) if field not in model.encoder.fields]
+    changed[..., excluded] *= 100
+    assert model.encoder.fields == ("close", "volume")
+    assert model.encoder.output_dim == (4 if encoder == "Raw" else 64)
+    with torch.inference_mode():
+        torch.testing.assert_close(model(*batch), model(changed, batch[1], batch[2]), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("name", MODERN_MODEL_NAMES)
 @pytest.mark.parametrize("pooling", ("last", "mean", "attention"))
 def test_encoder_backbone_head_joint_gradients_and_updates(name, pooling):
@@ -136,8 +150,11 @@ def test_every_trainable_a_encoder_is_updated_without_precomputed_tokens(encoder
 @pytest.mark.parametrize("encoder", ENCODER_NAMES)
 def test_all_a_encoders_compose_and_eval_microbatch_matches(name, encoder):
     torch.manual_seed(331)
-    model = create_score_model(modern_spec(name, encoder=encoder, pooling="mean")).eval()
+    model = create_score_model(modern_spec(name, encoder=encoder, pooling="mean"))
     batch = inputs()
+    with torch.no_grad():
+        model(*batch)  # Fit nontrivial running statistics in A's BatchNorm encoders.
+    model.eval()
     with torch.inference_mode():
         whole = model(*batch)
         pieces = torch.cat([model(*(item[index:index+1] for item in batch)) for index in range(4)])
@@ -265,6 +282,50 @@ def test_transformer_layers_initialize_independently_and_odd_width_is_supported(
     assert torch.isfinite(model(*inputs())).all()
 
 
+def test_repr_distinguishes_configuration_without_different_weight_shapes():
+    spec = modern_spec("B-Transformer")
+    model = create_score_model(spec)
+    for changed in (replace(spec, pooling="mean"), replace(spec, causal=False), replace(spec, lookback=60)):
+        candidate = create_score_model(changed)
+        assert model.state_dict().keys() == candidate.state_dict().keys()
+        assert all(value.shape == candidate.state_dict()[key].shape for key, value in model.state_dict().items())
+        assert repr(model) != repr(candidate)
+    before = repr(model)
+    model.pool.mode = "mean"
+    assert repr(model) != before  # Also expose behavioral attributes changed after construction.
+    before = repr(model)
+    model.backbone.causal = False
+    assert repr(model) != before
+
+
+def test_selective_scan_matches_closed_form_stable_constant_input_solution():
+    block = _SelectiveStateBlock(width=2, state_dim=2, kernel_size=1, dropout=0.0).eval()
+    rate = torch.tensor([[0.8, 1.7], [1.2, 2.3]])
+    u = torch.nn.functional.silu(torch.tensor(1.0))
+    with torch.no_grad():
+        block.in_projection.weight.zero_()
+        block.in_projection.bias.fill_(1)
+        block.convolution.weight.fill_(1)
+        block.convolution.bias.zero_()
+        block.delta.weight.zero_()
+        block.delta.bias.fill_(torch.log(torch.expm1(torch.tensor(0.1))))
+        block.log_rate.copy_(torch.log(torch.expm1(rate - 1e-4)))
+        block.selectors.weight.zero_()
+        block.selectors.weight[:2, 0] = 0.2 / u
+        block.selectors.weight[2:, 0] = 0.3 / u
+        block.skip.zero_()
+        block.out_projection.weight.copy_(torch.eye(2))
+        block.out_projection.bias.zero_()
+    valid = torch.tensor([[True] * 5 + [False] * 2])
+    with torch.inference_mode():
+        actual = block(torch.zeros((1, 7, 2)), valid)
+    elapsed = torch.arange(1, 6)[:, None, None] * 0.1
+    state = -torch.expm1(-elapsed * rate) / rate * torch.tanh(torch.tensor(0.2)) * u
+    expected = state.sum(-1) * torch.tanh(torch.tensor(0.3)) * u
+    torch.testing.assert_close(actual[0, :5], expected, rtol=2e-5, atol=2e-6)
+    assert torch.count_nonzero(actual[0, 5:]) == 0
+
+
 @pytest.mark.parametrize("bad_input", ("dtype", "nan", "nonzero_missing", "right_padding"))
 def test_modern_models_preserve_strict_a_input_validation(bad_input):
     model = create_score_model(modern_spec("B-GRU"))
@@ -279,3 +340,42 @@ def test_modern_models_preserve_strict_a_input_validation(bad_input):
         valid[0, -2] = False
     with pytest.raises(ContractError):
         model(x, observed, valid)
+
+
+@pytest.mark.parametrize("name", MODERN_MODEL_NAMES)
+def test_cpu_bfloat16_autocast_preserves_joint_training(name):
+    torch.manual_seed(415)
+    model = create_score_model(modern_spec(name))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        scores = model(*inputs())
+        loss = scores.float().square().mean()
+    loss.backward()
+    assert torch.isfinite(scores).all()
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+
+
+@pytest.mark.skipif(os.environ.get("PTOP_TEST_CUDA") != "1", reason="CUDA requires explicit isolated-device opt-in")
+@pytest.mark.parametrize("name", MODERN_MODEL_NAMES)
+def test_isolated_cuda_inference_matches_cpu_and_joint_gradients_are_finite(name):
+    assert torch.cuda.is_available(), "PTOP_TEST_CUDA=1 requires an explicitly assigned CUDA_VISIBLE_DEVICES"
+    torch.manual_seed(782)
+    cpu = create_score_model(modern_spec(name)).eval()
+    cuda = create_score_model(modern_spec(name)).cuda().eval()
+    cuda.load_state_dict(cpu.state_dict(), strict=True)
+    cpu_inputs = inputs()
+    cuda_inputs = tuple(item.cuda() for item in cpu_inputs)
+    with torch.inference_mode():
+        expected = cpu(*cpu_inputs)
+        actual = cuda(*cuda_inputs)
+        pieces = torch.cat([cuda(*(item[index:index+1] for item in cuda_inputs)) for index in range(4)])
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(actual, pieces, rtol=2e-4, atol=2e-5)
+    cuda.train()
+    before = {key: parameter.detach().clone() for key, parameter in cuda.named_parameters()}
+    optimizer = torch.optim.AdamW(cuda.parameters(), lr=0.002)
+    cuda(*cuda_inputs).square().mean().backward()
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in cuda.parameters())
+    optimizer.step()
+    for prefix in ("encoder.", "backbone.", "head."):
+        assert any(not torch.equal(before[key], parameter) for key, parameter in cuda.named_parameters()
+                   if key.startswith(prefix))

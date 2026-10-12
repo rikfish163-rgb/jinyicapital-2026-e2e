@@ -125,6 +125,9 @@ class TemporalScoreModel(nn.Module):
         self.head = nn.Sequential(nn.Linear(spec.width, spec.head_width), nn.GELU(), nn.Dropout(spec.dropout),
                                   nn.Linear(spec.head_width, 1))
 
+    def extra_repr(self) -> str:
+        return f"spec={self.spec!r}"
+
     def forward(self, x: Tensor, observed: Tensor, step_valid: Tensor) -> Tensor:
         if x.ndim == 3 and x.shape[1] > self.spec.lookback:
             raise ContractError(f"输入窗口长度 {x.shape[1]} 超过 ModelSpec.lookback={self.spec.lookback}")

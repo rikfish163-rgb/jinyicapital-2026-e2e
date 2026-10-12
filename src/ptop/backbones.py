@@ -44,6 +44,9 @@ class TemporalPool(nn.Module):
         self.mode = mode
         self.attention = nn.Linear(width, 1) if mode == "attention" else None
 
+    def extra_repr(self) -> str:
+        return f"mode={self.mode!r}"
+
     def forward(self, output: Tensor, valid: Tensor, lengths: Tensor) -> Tensor:
         if self.mode == "last":
             return output[torch.arange(len(output), device=output.device), lengths - 1]
@@ -87,6 +90,9 @@ class TransformerBackbone(nn.Module):
         self.dropout = nn.Dropout(dropout)
         frequencies = torch.exp(torch.arange(0, width, 2, dtype=torch.float32) * (-math.log(10000.0) / width))
         self.register_buffer("position_frequencies", frequencies)
+
+    def extra_repr(self) -> str:
+        return f"width={self.width}, causal={self.causal}"
 
     def positions(self, length: int, reference: Tensor) -> Tensor:
         """Sinusoidal positions built at runtime, with no fixed learned-table limit."""
