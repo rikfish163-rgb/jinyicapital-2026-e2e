@@ -1,0 +1,2 @@
+# Reuse A's exact runtime pins, including the audited Qlib source revision.
+-r requirements-a.txt
