@@ -1,5 +1,8 @@
 import hashlib
 import json
+import os
+import shutil
+import tempfile
 from importlib.metadata import version
 from pathlib import Path
 
@@ -14,6 +17,9 @@ from .schema import BOOK12_FIELDS, FEATURES, QLIB_COMMIT, SCHEMA_VERSION, Contra
 
 BUNDLE_VERSION = 1
 MODEL_NAMES = ("R0", "R1", "R1-Book", "Net64", "Net192", "GroupedNet", "Patch1", "Patch5", "DeepLOB")
+MODERN_BUNDLE_VERSION = 2
+MODERN_MODEL_NAMES = ("B-GRU", "B-Transformer", "B-TCN", "B-SelectiveSSM")
+ALL_MODEL_NAMES = MODEL_NAMES + MODERN_MODEL_NAMES
 REQUIRED_CONTRACTS = ("source", "sampling", "universe", "visibility", "label", "training_scope")
 
 
@@ -32,6 +38,10 @@ def create_model(name: str):
         return AttentionModel(PatchEncoder(patch_size=int(name[-1])))
     if name == "DeepLOB":
         return DeepLOBModel()
+    if name in MODERN_MODEL_NAMES:
+        # temporal 的旧候选工厂调用本函数；延迟导入避免循环。
+        from .temporal import ModelSpec, create_score_model
+        return create_score_model(ModelSpec(name=name))
     raise ContractError(f"未知模型配置 {name!r}")
 
 
@@ -55,7 +65,7 @@ def _validate_tensor_state(state: dict) -> None:
             raise ContractError(f"BatchNorm 状态必须非负：{name}")
 
 
-def save_bundle(path, model, preprocessor: FrozenPreprocessor, *, model_name: str,
+def _save_bundle_v1(path, model, preprocessor: FrozenPreprocessor, *, model_name: str,
                 window_length: int, contracts: dict[str, str], seed: int, training_record: dict,
                 instrument_map: dict[int, str]) -> None:
     if type(window_length) is not int or window_length <= 0:
@@ -112,7 +122,7 @@ def save_bundle(path, model, preprocessor: FrozenPreprocessor, *, model_name: st
     )
 
 
-def load_bundle(path):
+def _load_bundle_v1(path):
     source = Path(path)
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     required = {"bundle_version", "schema_version", "fields", "qlib_commit", "dependencies", "model_name",
@@ -171,6 +181,294 @@ def load_bundle(path):
             raise ContractError(f"模型包权重包含非有限数值：{name}")
         state[name] = tensor
     _validate_tensor_state(state)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model, processor, manifest
+
+
+def _json_object(path: Path) -> dict:
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ContractError(f"JSON 字段重复：{key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=object_pairs,
+                           parse_constant=lambda value: (_ for _ in ()).throw(
+                               ContractError(f"JSON 包含非有限数值：{value}")))
+    except (OSError, ValueError, TypeError) as error:
+        if isinstance(error, ContractError):
+            raise
+        raise ContractError(f"模型包 JSON 缺失或无效：{path.name}") from error
+    if not isinstance(value, dict):
+        raise ContractError(f"模型包 JSON 必须为对象：{path.name}")
+    return value
+
+
+def _model_spec_dict(model_spec) -> dict:
+    from .temporal import ModelSpec
+    if isinstance(model_spec, ModelSpec):
+        return model_spec.to_dict()
+    if not isinstance(model_spec, dict):
+        raise ContractError("model_spec 必须为 ModelSpec 或其完整字典")
+    return ModelSpec.from_dict(model_spec).to_dict()
+
+
+def _create_spec_model(model_spec):
+    from .temporal import ModelSpec, create_score_model
+    return create_score_model(ModelSpec.from_dict(_model_spec_dict(model_spec)))
+
+
+def _validated_model_state(model, *, model_spec=None, model_name=None) -> dict:
+    """先对照配置和编码器，再复制权重；检查不能只覆盖张量形状。"""
+    if not isinstance(model, torch.nn.Module):
+        raise ContractError("model 必须为已构造的 torch.nn.Module")
+    with torch.random.fork_rng(devices=[]):
+        template = _create_spec_model(model_spec) if model_spec is not None else create_model(model_name)
+    expected = template.state_dict()
+    state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+    _validate_state_shapes(state, expected)
+    if type(template) is not type(model) or type(template.encoder) is not type(model.encoder):
+        raise ContractError("模型类型与保存配置不一致")
+    if repr(template) != repr(model):
+        raise ContractError("模型模块配置与保存规格不一致")
+    if template.encoder.fields != model.encoder.fields or template.encoder.output_dim != model.encoder.output_dim:
+        raise ContractError("编码器字段或输出宽度与保存配置不一致")
+    if getattr(template.encoder, "patch_size", None) != getattr(model.encoder, "patch_size", None):
+        raise ContractError("patch 配置与保存配置不一致")
+    return state
+
+
+def _validate_state_shapes(state, expected) -> None:
+    if not isinstance(state, dict) or set(state) != set(expected):
+        raise ContractError("模型权重名称与配置不一致")
+    for name, value in state.items():
+        if (not isinstance(value, torch.Tensor) or value.layout != torch.strided
+                or value.shape != expected[name].shape or value.dtype != expected[name].dtype):
+            raise ContractError(f"模型权重类型或形状与配置不一致：{name}")
+    _validate_tensor_state(state)
+
+
+def _validate_contracts(contracts) -> None:
+    if not isinstance(contracts, dict) or set(contracts) != set(REQUIRED_CONTRACTS) or any(
+        not isinstance(value, str) or not value.strip() for value in contracts.values()
+    ):
+        raise ContractError(f"模型包必须明确提供合同版本 {REQUIRED_CONTRACTS}")
+
+
+def _json_tensors(state: dict) -> dict:
+    return {name: {"dtype": str(value.dtype).removeprefix("torch."),
+                   "shape": list(value.shape), "data": value.reshape(-1).tolist()}
+            for name, value in state.items()}
+
+
+def _read_json_tensors(path: Path, expected: dict) -> dict:
+    serialized = _json_object(path)
+    if set(serialized) != set(expected):
+        raise ContractError("模型包权重名称与模型配置不一致")
+    state = {}
+    for name, template in expected.items():
+        entry = serialized[name]
+        if not isinstance(entry, dict) or set(entry) != {"dtype", "shape", "data"}:
+            raise ContractError(f"张量元数据不完整：{name}")
+        if (not isinstance(entry["shape"], list) or any(type(size) is not int for size in entry["shape"])
+                or entry["shape"] != list(template.shape)
+                or entry["dtype"] != str(template.dtype).removeprefix("torch.")):
+            raise ContractError(f"张量类型或形状不符合模型配置：{name}")
+        values = entry["data"]
+        if (not isinstance(values, list) or len(values) != template.numel()
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values)):
+            raise ContractError(f"张量元素必须是符合数量的数值：{name}")
+        if not template.is_floating_point() and any(type(value) is not int for value in values):
+            raise ContractError(f"整数状态不允许截断浮点值：{name}")
+        try:
+            state[name] = torch.tensor(values, dtype=template.dtype).reshape(template.shape)
+        except (ValueError, RuntimeError, OverflowError) as error:
+            raise ContractError(f"张量元素无法按配置读取：{name}") from error
+    _validate_state_shapes(state, expected)
+    return state
+
+
+def _write_json(path: Path, value) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def _atomic_directory(path, writer) -> None:
+    destination = Path(path)
+    if destination.exists():
+        raise FileExistsError(f"模型包路径已经存在：{destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    stage = temporary / "bundle"
+    try:
+        writer(stage)
+        for file in stage.rglob("*"):
+            if file.is_file():
+                with file.open("rb") as stream:
+                    os.fsync(stream.fileno())
+        if destination.exists():
+            raise FileExistsError(f"模型包路径已经存在：{destination}")
+        os.rename(stage, destination)
+        descriptor = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def save_bundle(path, model, preprocessor: FrozenPreprocessor, *, model_name: str | None = None,
+                model_spec=None, window_length: int, contracts: dict[str, str], seed: int,
+                training_record: dict, instrument_map: dict[int, str], weight_format: str = "json",
+                include_source: bool | None = None) -> None:
+    """保存可审计的推理包。旧调用保持 v1；ModelSpec/torch/source 使用严格 v2。
+
+    source 只携带可信仓库代码，load_bundle 不执行包内 Python 文件。保存先验证合同，
+    在同目录暂存并原子改名；已有路径不能覆盖。
+    """
+    if weight_format not in ("json", "torch"):
+        raise ContractError("weight_format 必须为 json 或 torch")
+    if include_source is not None and type(include_source) is not bool:
+        raise ContractError("include_source 必须为 bool 或 None")
+    if (model_spec is None and model_name in MODEL_NAMES and weight_format == "json"
+            and include_source in (None, False)):
+        return _atomic_directory(path, lambda stage: _save_bundle_v1(
+            stage, model, preprocessor, model_name=model_name, window_length=window_length,
+            contracts=contracts, seed=seed, training_record=training_record, instrument_map=instrument_map))
+    from .temporal import ModelSpec
+    if model_spec is None:
+        if not isinstance(model_name, str):
+            raise ContractError("模型包需要 model_name 或 model_spec")
+        model_spec = ModelSpec(name=model_name, lookback=window_length)
+    spec = _model_spec_dict(model_spec)
+    if model_name is not None and model_name != spec["name"]:
+        raise ContractError("model_name 与 model_spec.name 不一致")
+    if type(window_length) is not int or window_length <= 0 or spec["lookback"] != window_length:
+        raise ContractError("window_length 必须为正整数并与 model_spec.lookback 一致")
+    if type(seed) is not int or not isinstance(training_record, dict) or not training_record:
+        raise ContractError("模型包必须包含随机种子和运行记录")
+    _validate_contracts(contracts)
+    mapping = _validate_mapping(instrument_map)
+    state = _validated_model_state(model, model_spec=spec)
+    processor_state = preprocessor.state_dict()
+    manifest = {
+        "bundle_version": MODERN_BUNDLE_VERSION, "schema_version": SCHEMA_VERSION,
+        "fields": list(FEATURES), "qlib_commit": QLIB_COMMIT, "dependencies": dependency_versions(),
+        "model_name": spec["name"], "model_spec": spec, "window_length": window_length,
+        "contracts": contracts, "seed": seed, "training_record": training_record,
+        "instrument_map": [[int(key), value] for key, value in sorted(mapping.items())],
+        "weight_format": weight_format, "source_files": [],
+    }
+    json.dumps(manifest, allow_nan=False)
+    portable = True if include_source is None else include_source
+
+    def writer(stage):
+        stage.mkdir()
+        weight_name = "model.json" if weight_format == "json" else "model.pt"
+        if weight_format == "json":
+            _write_json(stage / weight_name, _json_tensors(state))
+        else:
+            torch.save(state, stage / weight_name)
+        _write_json(stage / "preprocessor.json", processor_state)
+        files = [weight_name, "preprocessor.json"]
+        if portable:
+            source_directory = stage / "source" / "ptop"
+            source_directory.mkdir(parents=True)
+            for original in sorted(Path(__file__).parent.glob("*.py")):
+                relative = f"source/ptop/{original.name}"
+                shutil.copyfile(original, stage / relative)
+                manifest["source_files"].append(relative)
+                files.append(relative)
+            dependencies = manifest["dependencies"]
+            lines = ["# Install the platform's matching torch build; no download is performed by load_bundle."]
+            lines.extend(f"{name}=={dependencies[name]}" for name in ("torch", "numpy", "pandas", "pyarrow"))
+            lines.append(f"pyqlib @ git+https://github.com/microsoft/qlib.git@{QLIB_COMMIT}")
+            (stage / "requirements.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            files.append("requirements.txt")
+            manifest["source_files"].append("requirements.txt")
+        manifest["files"] = {name: _digest(stage / name) for name in files}
+        _write_json(stage / "manifest.json", manifest)
+
+    _atomic_directory(path, writer)
+
+
+def load_bundle(path):
+    """仅恢复已训练模型和冻结处理器；不会 fit、下载依赖或执行携带源码。"""
+    source = Path(path)
+    manifest = _json_object(source / "manifest.json")
+    if type(manifest.get("bundle_version")) is not int:
+        raise ContractError("模型包版本缺失或无效")
+    if manifest["bundle_version"] == BUNDLE_VERSION:
+        # 原格式和严格依赖/合同检查完整保留；创建模板不改变调用方随机状态。
+        with torch.random.fork_rng(devices=[]):
+            try:
+                return _load_bundle_v1(source)
+            except OSError as error:
+                raise ContractError("模型包文件缺失或无法读取") from error
+    required = {"bundle_version", "schema_version", "fields", "qlib_commit", "dependencies", "model_name",
+                "model_spec", "window_length", "contracts", "seed", "training_record", "instrument_map",
+                "files", "weight_format", "source_files"}
+    if set(manifest) != required or manifest["bundle_version"] != MODERN_BUNDLE_VERSION:
+        raise ContractError("模型包配置字段缺失、未知或版本不支持")
+    if manifest["schema_version"] != SCHEMA_VERSION or manifest["fields"] != list(FEATURES):
+        raise ContractError("模型包 schema 或字段顺序不一致")
+    if manifest["qlib_commit"] != QLIB_COMMIT or manifest["dependencies"] != dependency_versions():
+        raise ContractError("模型包 Qlib 来源或依赖版本与运行环境不一致")
+    spec = _model_spec_dict(manifest["model_spec"])
+    if (manifest["model_spec"] != spec or manifest["model_name"] != spec["name"] or type(manifest["window_length"]) is not int
+            or manifest["window_length"] <= 0 or manifest["window_length"] != spec["lookback"]):
+        raise ContractError("模型包窗口或模型配置不一致")
+    _validate_contracts(manifest["contracts"])
+    if type(manifest["seed"]) is not int or not isinstance(manifest["training_record"], dict) or not manifest["training_record"]:
+        raise ContractError("模型包缺少有效随机种子或运行记录")
+    entries = manifest["instrument_map"]
+    if (not isinstance(entries, list) or any(not isinstance(entry, list) or len(entry) != 2 for entry in entries)
+            or len(dict(entries)) != len(entries)):
+        raise ContractError("模型包股票映射格式无效或键重复")
+    _validate_mapping(dict(entries))
+    weight_format = manifest["weight_format"]
+    if weight_format not in ("json", "torch"):
+        raise ContractError("模型包权重格式无效")
+    weight_name = "model.json" if weight_format == "json" else "model.pt"
+    portable_files = manifest["source_files"]
+    if (not isinstance(portable_files, list) or any(not isinstance(name, str) for name in portable_files)
+            or len(set(portable_files)) != len(portable_files)):
+        raise ContractError("模型包携带源码清单无效")
+    for name in portable_files:
+        parts = Path(name).parts
+        if name != str(Path(name)) or (name != "requirements.txt" and (
+            len(parts) != 3 or parts[:2] != ("source", "ptop") or not parts[-1].endswith(".py")
+        )):
+            raise ContractError("模型包源码路径无效")
+    file_checksums = manifest["files"]
+    if not isinstance(file_checksums, dict) or set(file_checksums) != {weight_name, "preprocessor.json", *portable_files}:
+        raise ContractError("模型包文件清单不完整")
+    for name, checksum in file_checksums.items():
+        file = source / name
+        if (not isinstance(checksum, str) or len(checksum) != 64 or file.is_symlink()
+                or any((source / parent).is_symlink() for parent in Path(name).parents if str(parent) != ".")):
+            raise ContractError(f"模型包文件校验信息或路径无效：{name}")
+        try:
+            matches = _digest(file) == checksum
+        except OSError as error:
+            raise ContractError(f"模型包文件缺失：{name}") from error
+        if not matches:
+            raise ContractError(f"模型包文件校验失败：{name}")
+    processor = FrozenPreprocessor.from_state_dict(_json_object(source / "preprocessor.json"))
+    with torch.random.fork_rng(devices=[]):
+        model = _create_spec_model(spec)
+    if weight_format == "json":
+        state = _read_json_tensors(source / weight_name, model.state_dict())
+    else:
+        try:
+            state = torch.load(source / weight_name, map_location="cpu", weights_only=True)
+        except Exception as error:
+            raise ContractError("模型包 torch 权重无法安全读取") from error
+        _validate_state_shapes(state, model.state_dict())
     model.load_state_dict(state, strict=True)
     model.eval()
     return model, processor, manifest
