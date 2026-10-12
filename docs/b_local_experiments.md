@@ -41,6 +41,8 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH=src /home/data4/hts/jyc2026_training_env/bin/
 
 配置使用 2020-01-02、01-03 训练，01-06 验证，原始 ID 为 11、16、19、30。`10:00/11:00/14:00` 是显式工程端点，只能证明它们在观察网格中，不能当作官方合法采样点。`bar_end_is_available=true` 是这次诊断的可见性假设，元数据明确保留 `production_visibility_verified=False`。
 
+B 额外记录原始 available_at 的来源。A 规范化按显式 bar-end 假设生成的列，在送入 A 窗口构造器前恢复为这个显式声明，因而 batch 正确记录 `visibility_basis="bar_end_only"` 与 `availability_assumption="bar_end_equals_available_at"`；真实来源提供的 available_at 才记录为 `provided_available_at`。这项来源区分不会改变实际窗口数值或可见性筛选。
+
 诊断目标是 sample_id 的 SHA256 映射到固定数值，**不是未来收益，不是官方标签，诊断 loss/IC 不代表金融预测效果**。默认矩阵为同一个 A ALSTM encoder 的 B-GRU、B-Transformer、B-TCN、B-SelectiveSSM，L=60/120、seeds=7/17/29，各 2 epochs、独立 600 秒预算。可用 `--models`、`--lookbacks`、`--seeds` 和 `--epochs` 选择有明确独立预算的子矩阵。
 
 产物位于私人 output_dir：`prepared_manifest.json`、`normalization.json`、`split_audit.parquet`、真实读取/前向的 `benchmark.json`，以及 matrix 下的训练日志、checkpoint、完整验证结果、`comparison.csv`、`seed_summary.csv` 和 `report.md`。报告明确区分已完成、失败和预算超限；超限不替换成更简单模型，只有上一完整 epoch 的 checkpoint 保证可恢复。`--resume-completed` 会验证已完成实验的协议和验证文件哈希后跳过。

@@ -109,6 +109,7 @@ class LocalBarStore:
         self._scope_dir: Path | None = None
         self._verified_days: set[str] = set()
         self.anomaly_counts_by_day: dict[str, dict[str, int]] = {}
+        self.availability_origin_by_day: dict[str, str] = {}
         self.profile = {"read_calls": 0, "read_seconds": 0.0, "rows_read": 0, "max_day_rows_read": 0,
                         "masked_negative_orders": {name: 0 for name in BOOK_ORDER_FIELDS}}
 
@@ -151,6 +152,7 @@ class LocalBarStore:
             raise ContractError("私人 raw cache 分区清单不完整")
         if self.manifest is None or self.manifest["identity"] != identity:
             self.anomaly_counts_by_day = {}
+            self.availability_origin_by_day = {}
         self.manifest, self._scope_dir = manifest, scope_dir
         self._verified_days.clear()
         return manifest
@@ -259,6 +261,11 @@ class LocalBarStore:
         if instrument_map is not None:
             kwargs.update(source="local", instrument_map=instrument_map)
         raw = normalizer(frame, **kwargs)
+        origin = ("source_available_at" if "available_at" in frame else
+                  "assumed_bar_end" if bar_end_is_available else "undeclared_availability")
+        if raw.metadata is not None:
+            raw.metadata.attrs["availability_origin"] = origin
+        self.availability_origin_by_day[key] = origin
         self.profile["read_calls"] += 1
         self.profile["read_seconds"] += time.perf_counter() - started
         self.profile["rows_read"] += len(raw.values)
@@ -292,6 +299,12 @@ def _window_dataset(raw: CanonicalData, expected: pd.DataFrame, grid: pd.Datetim
                     length: int, fields: Sequence[str], scope: str, bar_end_is_available: bool):
     from .windows import LocalAuditWindowDataset, WindowDataset
 
+    if raw.metadata is not None and raw.metadata.attrs.get("availability_origin") == "assumed_bar_end":
+        # A's normalizer materializes available_at when the caller declares bar
+        # end availability. A's window constructor must see the explicit flag,
+        # so it does not misreport this generated column as source-provided.
+        raw = CanonicalData(raw.values, raw.observed, raw.metadata.drop(columns="available_at"),
+                            dict(raw.instrument_map), raw.duplicate_rows)
     cls = WindowDataset if scope == "official" else LocalAuditWindowDataset
     return cls(raw, expected, grid, length=length, fields=fields, bar_end_is_available=bar_end_is_available)
 
@@ -613,6 +626,7 @@ def _prepare(store: LocalBarStore, expected: pd.DataFrame, targets: pd.DataFrame
                 "window_length": window_length, "fit_window_length": fit_length, "fields": list(fields), "seed": seed,
                 "negative_order_policy": store.policy.negative_order_policy, "bar_end_is_available": bar_end_is_available}
     manifest["negative_order_cells_by_loaded_day"] = {key: dict(value) for key, value in store.anomaly_counts_by_day.items()}
+    manifest["availability_origin_by_loaded_day"] = dict(store.availability_origin_by_day)
     prepared = PreparedLocalFold(processor, store, train_expected, validation_expected, train, validation, audit,
         trading_grid, fold, label_spec, scope, window_length, fit_length, tuple(fields), seed, bar_end_is_available,
         dict(instrument_map) if instrument_map is not None else None, diagnostics, manifest)

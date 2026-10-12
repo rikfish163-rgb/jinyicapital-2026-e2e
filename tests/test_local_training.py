@@ -269,6 +269,29 @@ def test_missing_formal_contract_fails_before_source_read_and_no_mapping_is_gues
     assert diagnostic.label_spec.version.startswith("diagnostic-")
 
 
+def test_assumed_bar_end_is_not_misreported_as_source_provided_availability(local_fixture):
+    source, bars, *_, store = local_fixture
+    feather.write_feather(bars.drop(columns="available_at"), source / "202401.0.feather", chunksize=4)
+    diagnostic = prepare_diagnostic_fold(store, days=["2024-01-02", "2024-01-03", "2024-01-04"],
+        instrument_ids=[1, 2], validation_start="2024-01-04", endpoint_minutes=["09:32", "09:34"],
+        window_length=4, bar_end_is_available=True)
+    raw = store.read_day("2024-01-02", bar_end_is_available=True)
+    assert raw.metadata.attrs["availability_origin"] == "assumed_bar_end"
+    assert raw.metadata.available_at.eq(raw.values.index.get_level_values("datetime")).all()
+    for batch in diagnostic.validation_loader():
+        assert batch.metadata.visibility_basis.eq("bar_end_only").all()
+        assert batch.metadata.availability_assumption.eq("bar_end_equals_available_at").all()
+        assert not batch.metadata.production_visibility_verified.any()
+    assert set(diagnostic.manifest["availability_origin_by_loaded_day"].values()) == {"assumed_bar_end"}
+    # A provided timestamp remains distinct from an explicitly assumed bar end.
+    feather.write_feather(bars, source / "202401.0.feather", chunksize=4)
+    provided = prepare_diagnostic_fold(store, days=["2024-01-02", "2024-01-03", "2024-01-04"],
+        instrument_ids=[1, 2], validation_start="2024-01-04", endpoint_minutes=["09:32", "09:34"], window_length=4)
+    batch = next(iter(provided.validation_loader()))
+    assert batch.metadata.visibility_basis.eq("provided_available_at").all()
+    assert batch.metadata.availability_assumption.eq("none").all()
+
+
 def test_target_support_at_split_boundary_is_purged_without_deleting_keys():
     expected = pd.DataFrame({"sample_id": ["a", "b", "c"], "decision_id": ["d1", "d2", "d3"],
         "instrument_id": [1, 1, 1], "decision_time": pd.to_datetime(["2024-01-02 10:00", "2024-01-02 10:02", "2024-01-02 10:03"])})
