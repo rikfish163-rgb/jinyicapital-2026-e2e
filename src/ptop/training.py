@@ -419,7 +419,9 @@ class Trainer:
                     raise ContractError("target conversion to float32 overflowed")
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
-                with torch.set_grad_enabled(training), self._autocast():
+                # AMP is a training optimization. Select checkpoints with the
+                # same FP32 forward used by the frozen inference entry point.
+                with torch.set_grad_enabled(training), (self._autocast() if training else nullcontext()):
                     scores = self.model(*inputs)
                     if scores.shape != target.shape or not torch.isfinite(scores).all():
                         raise ContractError("model must return finite [B] scores")
@@ -582,6 +584,7 @@ class Trainer:
             "score_units": ("training-target-scale normalized score" if isinstance(self.objective, RegressionObjective)
                             else objective_config.get("score_units", "custom objective; units declared by C")),
             "cuda_epoch_seed": "(seed + epoch_index) modulo 2**32; resets cuDNN RNN dropout state",
+            "validation_precision": "fp32", "inference_precision": "fp32",
             "platform_evaluation_verified": False,
         })
         stop_reason = "epochs_completed"
@@ -645,12 +648,18 @@ class Trainer:
             selected_model, selected_processor = self._selected_checkpoint(processor, split, best_epoch, best_metric)
             bundle_path = self.output_dir / "bundles" / f"epoch{best_epoch:04d}"
             bundle_path.parent.mkdir(exist_ok=True)
+            training_record = {"scope": self.scope, "best_epoch": best_epoch, "best_metric": best_metric,
+                               "metric": self.config.selection_metric, "target_scale": self.target_scale,
+                               "training": self.config.to_dict(), "objective": objective_config,
+                               "validation_precision": "fp32", "inference_precision": "fp32",
+                               "split": split, "research_only": True}
             if bundle_path.exists():
                 from .bundle import load_bundle
                 bundled, bundled_processor, manifest = load_bundle(bundle_path)
                 if (bundled_processor.fingerprint != selected_processor.fingerprint or
                         manifest["contracts"] != self.contracts or
                         manifest.get("model_spec") != self.model_spec.to_dict() or
+                        manifest["training_record"] != training_record or
                         any(not torch.equal(value.cpu(), bundled.state_dict()[name].cpu())
                             for name, value in selected_model.state_dict().items())):
                     raise ContractError("existing selected bundle differs from the verified best checkpoint")
@@ -658,9 +667,7 @@ class Trainer:
                 save_bundle(bundle_path, selected_model, selected_processor, model_name=self.model_spec.name,
                             model_spec=self.model_spec, window_length=self.model_spec.lookback,
                             contracts=self.contracts, seed=self.config.seed,
-                            training_record={"scope": self.scope, "best_epoch": best_epoch, "best_metric": best_metric,
-                                             "metric": self.config.selection_metric, "target_scale": self.target_scale,
-                                             "split": split, "research_only": True}, instrument_map=self.instrument_map)
+                            training_record=training_record, instrument_map=self.instrument_map)
         result = TrainingResult(history, self.best_checkpoint, self.last_checkpoint, bundle_path,
                                 float(best_metric), best_epoch, completed, stop_reason)
         write_json(self.output_dir / "result.json", {"best_metric": best_metric, "best_epoch": best_epoch,

@@ -101,6 +101,9 @@ def test_joint_training_export_and_label_independent_validation(prepared_fold, t
     with torch.no_grad():
         torch.testing.assert_close(best(*inputs), restored(*inputs), rtol=0, atol=0)
     assert processor.fingerprint == fingerprint and manifest["model_spec"]["name"] == "B-GRU"
+    assert manifest["training_record"]["training"] == trainer.config.to_dict()
+    assert manifest["training_record"]["validation_precision"] == "fp32"
+    assert manifest["training_record"]["inference_precision"] == "fp32"
     assert json.loads((tmp_path / "joint/result.json").read_text())["platform_evaluation_verified"] is False
 
 
@@ -195,6 +198,23 @@ def test_full_trainer_cpu_bfloat16_validation(prepared_fold, tmp_path):
     spec = ModelSpec(name="B-Transformer", lookback=4, width=8, layers=1, head_width=8)
     result = make_trainer(tmp_path / "bf16", mapping, fold, model_spec=spec, config=config).fit(prepared)
     assert np.isfinite(result.best_metric)
+    assert_fp32_validation_replay(result, prepared, device="cpu")
+
+
+def assert_fp32_validation_replay(result, prepared, *, device):
+    """Saved selection scores must agree with a fresh default inference model."""
+    from ptop.checkpoint import load_inference_checkpoint
+    model, _, _ = load_inference_checkpoint(result.best_checkpoint, device=device)
+    saved = pd.read_parquet(result.best_checkpoint.parent / "validation" /
+                            f"epoch-{result.best_epoch:04d}.parquet").set_index("sample_id")
+    for batch in prepared.validation_loader:
+        selected = batch.predictable
+        inputs = [torch.as_tensor(value[selected], device=device)
+                  for value in (batch.x, batch.observed, batch.step_valid)]
+        with torch.inference_mode():
+            scores = model(*inputs).float().cpu().numpy()
+        expected = saved.loc[batch.metadata.loc[selected, "sample_id"], "score"].to_numpy()
+        np.testing.assert_allclose(scores, expected, rtol=1e-5, atol=1e-6)
 
 
 def test_purge_is_by_explicit_support_not_prediction_time(prepared_fold):

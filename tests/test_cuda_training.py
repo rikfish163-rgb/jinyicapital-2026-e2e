@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from test_training import assert_nested_equal, make_trainer, prepared_fold
+from test_training import assert_fp32_validation_replay, assert_nested_equal, make_trainer, prepared_fold
 from ptop.checkpoint import load_inference_checkpoint
 from ptop.temporal import ModelSpec
 from ptop.training_config import TrainingConfig
@@ -35,6 +35,7 @@ def test_complete_cuda_amp_train_checkpoint_and_export(name, precision, prepared
               for value in (batch.x, batch.observed, batch.step_valid)]
     with torch.inference_mode():
         assert torch.isfinite(restored(*inputs)).all()
+    assert_fp32_validation_replay(result, prepared, device="cuda:0")
 
 
 @pytest.mark.parametrize("layers", (1, 2))
