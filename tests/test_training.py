@@ -161,6 +161,29 @@ def test_raw_baseline_trains_without_parameterized_encoder(prepared_fold, tmp_pa
     assert trainer.fit(prepared).completed_epochs == 1
 
 
+@pytest.mark.parametrize("name", ("R1", "R1-Book", "Net64", "Net192", "GroupedNet", "Patch1", "Patch5", "DeepLOB",
+                                   "B-Transformer", "B-TCN", "B-SelectiveSSM"))
+def test_complete_training_and_best_export_for_all_supported_families(name, prepared_fold, tmp_path):
+    prepared, mapping, fold = prepared_fold
+    spec = ModelSpec(name=name, lookback=4)
+    config = TrainingConfig(epochs=1, patience=1, selection_metric="loss", mode="min", seed=19, microbatch_size=3)
+    trainer = make_trainer(tmp_path / name, mapping, fold, model_spec=spec, config=config)
+    result = trainer.fit(prepared)
+    assert result.completed_epochs == 1 and result.bundle_path.is_dir()
+    restored, _, manifest = load_bundle(result.bundle_path)
+    assert manifest["model_spec"] == spec.to_dict()
+    assert type(restored) is type(trainer.model)
+
+
+def test_full_trainer_cpu_bfloat16_validation(prepared_fold, tmp_path):
+    prepared, mapping, fold = prepared_fold
+    config = TrainingConfig(epochs=1, patience=1, selection_metric="loss", mode="min", seed=19,
+                            precision="bf16", microbatch_size=3)
+    spec = ModelSpec(name="B-Transformer", lookback=4, width=8, layers=1, head_width=8)
+    result = make_trainer(tmp_path / "bf16", mapping, fold, model_spec=spec, config=config).fit(prepared)
+    assert np.isfinite(result.best_metric)
+
+
 def test_purge_is_by_explicit_support_not_prediction_time(prepared_fold):
     prepared, _, fold = prepared_fold
     table = prepared.train_targets.copy()

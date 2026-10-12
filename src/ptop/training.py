@@ -185,6 +185,8 @@ def validate_batch(batch: WindowBatch, fields: tuple[str, ...], *, length: int, 
     if batch.x.ndim != 3 or batch.x.shape[1:] != (length, len(FEATURES)) or batch.x.dtype != np.float32:
         raise ContractError("WindowBatch x must match the configured float32 [B,L,25]")
     count = len(batch.x)
+    if count == 0:
+        raise ContractError("WindowBatch must contain at least one declared sample")
     if batch.observed.shape != batch.x.shape or batch.observed.dtype != bool:
         raise ContractError("observed must be bool [B,L,25]")
     if batch.step_valid.shape != (count, length) or batch.step_valid.dtype != bool:
@@ -207,11 +209,20 @@ def validate_batch(batch: WindowBatch, fields: tuple[str, ...], *, length: int, 
     if scope == "official" and "production_visibility_verified" in batch.metadata and not batch.metadata.production_visibility_verified.all():
         raise ContractError("local audit windows cannot be presented as official supervised windows")
     decisions = pd.DatetimeIndex(batch.metadata.decision_time).to_numpy(dtype="datetime64[ns]")
+    if (np.any(batch.row_positions < -1) or np.any(batch.row_positions[~batch.step_valid] != -1)
+            or not np.isnat(batch.bar_times[~batch.step_valid]).all()):
+        raise ContractError("structural padding needs NaT times and row_positions=-1")
     if np.isnat(batch.bar_times[batch.step_valid]).any() or np.any(batch.bar_times[batch.step_valid] > np.broadcast_to(decisions[:, None], batch.step_valid.shape)[batch.step_valid]):
         raise ContractError("window contains an invalid or future bar time")
     adjacent = batch.step_valid[:, 1:] & batch.step_valid[:, :-1]
     if np.any((batch.bar_times[:, 1:] <= batch.bar_times[:, :-1])[adjacent]):
         raise ContractError("window bar times must strictly increase")
+    valid_times = batch.bar_times[batch.step_valid]
+    decision_grid = np.broadcast_to(decisions[:, None], batch.step_valid.shape)[batch.step_valid]
+    if (not batch.step_valid[:, -1].all() or not np.array_equal(batch.bar_times[:, -1], decisions)
+            or not np.array_equal(valid_times.astype("datetime64[D]"), decision_grid.astype("datetime64[D]"))
+            or not np.array_equal(valid_times.astype("datetime64[m]").astype("datetime64[ns]"), valid_times)):
+        raise ContractError("A windows must contain same-day minute slots ending at their decision")
     if np.any(batch.observed.any(-1) & (batch.row_positions < 0)):
         raise ContractError("observed values require a traceable source row")
     positions = [FEATURES.index(name) for name in fields]
@@ -436,6 +447,13 @@ class Trainer:
 
         if stop_after_epochs is not None and (type(stop_after_epochs) is not int or stop_after_epochs < 1):
             raise ContractError("stop_after_epochs must be a positive invocation limit")
+        declared_scope = getattr(prepared, "scope", None)
+        if declared_scope is not None and (
+            not isinstance(declared_scope, str) or
+            (self.scope == "official" and declared_scope != "official") or
+            (self.scope == "diagnostic" and not declared_scope.startswith("diagnostic"))
+        ):
+            raise ContractError("prepared data scope differs from the explicitly requested training scope")
         processor = getattr(prepared, "processor", None)
         if not isinstance(processor, FrozenPreprocessor):
             raise ContractError("A must provide a fitted and frozen FrozenPreprocessor")
@@ -451,7 +469,7 @@ class Trainer:
         if not train.label_spec_version.eq(self.contracts["label"]).all():
             raise ContractError("label table version differs from the persisted label contract")
         scale_values = train.loc[train.target_valid, "target"].to_numpy(dtype=np.float64)
-        if scale_values.size < 2:
+        if self.config.target_scale is None and scale_values.size < 2:
             raise ContractError("need at least two finite training labels to calibrate/verify target scale")
         self.target_scale = self.config.target_scale if self.config.target_scale is not None else float(scale_values.std(ddof=0))
         if not math.isfinite(self.target_scale) or self.target_scale <= 0:
@@ -498,7 +516,8 @@ class Trainer:
             "training": self.config.to_dict(), "model": self.model_spec.to_dict(), "contracts": self.contracts,
             "split": split, "preprocessor_fingerprint": processor.fingerprint,
             "objective": objective_config, "device": str(self.device), "scope": self.scope,
-            "score_units": "training-target-scale normalized score",
+            "score_units": ("training-target-scale normalized score" if isinstance(self.objective, RegressionObjective)
+                            else objective_config.get("score_units", "custom objective; units declared by C")),
             "platform_evaluation_verified": False,
         })
         stop_reason = "epochs_completed"
