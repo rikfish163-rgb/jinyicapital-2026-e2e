@@ -152,7 +152,9 @@ def predict_windows(model, batches: Iterable[WindowBatch], expected: pd.DataFram
     lookback = getattr(getattr(model, "spec", None), "lookback", None)
     try:
         model.eval()
-        with torch.inference_mode():
+        # A DataLoader without an explicit generator draws its worker base seed
+        # even with num_workers=0; iteration must not change the caller RNG.
+        with torch.random.fork_rng(devices=[]), torch.inference_mode():
             for batch in batches:
                 metadata = _validate_batch(batch, lookup, fields, lookback=lookback)
                 ids = metadata["sample_id"].tolist()

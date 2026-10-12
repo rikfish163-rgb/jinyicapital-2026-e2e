@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from ptop.bundle import REQUIRED_CONTRACTS, create_model, load_bundle, save_bundle
 from ptop.checkpoint import load_checkpoint, load_inference_checkpoint, save_checkpoint
@@ -21,7 +22,7 @@ from ptop.official import LABEL_TABLE, SECTION_TABLE, expected_from_sections
 from ptop.preprocessing import FrozenPreprocessor
 from ptop.schema import BOOK12_FIELDS, FEATURES, ContractError
 from ptop.temporal import ModelSpec, create_score_model
-from ptop.windows import WindowDataset
+from ptop.windows import DecisionBatchSampler, WindowDataset, collate_windows
 
 
 CONTRACTS = {name: "synthetic-interface-v1" for name in REQUIRED_CONTRACTS}
@@ -138,7 +139,7 @@ def test_modern_bundle_roundtrip_all_families(inputs, tmp_path, name, weight_for
     pd.testing.assert_frame_equal(first.records, second.records)
 
 
-@pytest.mark.parametrize("file", ["model.pt", "preprocessor.json", "source/ptop/temporal.py", "requirements.txt"])
+@pytest.mark.parametrize("file", ["model.pt", "preprocessor.json", "source/ptop/temporal.py", "requirements.txt", "licenses/pyqlib/LICENSE"])
 def test_bundle_modified_file_rejected(inputs, tmp_path, file):
     _, _, processor, _, _, _, mapping, _ = inputs
     spec = _spec()
@@ -197,6 +198,47 @@ def test_bundle_rejects_equal_shaped_weights_with_different_behavior(inputs, tmp
     with pytest.raises(ContractError, match="规格|模块配置"):
         _save_bundle(path, model, processor, mapping, different, weight_format="torch")
     assert not path.exists()
+
+
+def test_bundle_and_checkpoint_reject_changed_execution_implementation(inputs, tmp_path, monkeypatch):
+    import ptop.bundle as bundle_module
+    import ptop.checkpoint as checkpoint_module
+
+    _, _, processor, _, _, _, mapping, _ = inputs
+    spec = _spec()
+    model, optimizer, _, _ = _training_objects(spec)
+    bundle_path, checkpoint_path = tmp_path / "bundle", tmp_path / "last.pt"
+    _save_bundle(bundle_path, model, processor, mapping, spec, weight_format="torch")
+    _checkpoint(checkpoint_path, model, optimizer, processor, spec)
+    changed = copy.deepcopy(bundle_module.execution_signature())
+    changed["files"]["ptop/backbones.py"] = "0" * 64
+    changed["fingerprint"] = "0" * 64
+    monkeypatch.setattr(bundle_module, "execution_signature", lambda: changed)
+    monkeypatch.setattr(checkpoint_module, "execution_signature", lambda: changed)
+    with pytest.raises(ContractError, match="执行源码"):
+        load_bundle(bundle_path)
+    with pytest.raises(ContractError, match="执行源码"):
+        load_checkpoint(checkpoint_path, model, optimizer)
+    with pytest.raises(ContractError, match="执行源码"):
+        load_inference_checkpoint(checkpoint_path)
+
+
+def test_portable_bundle_uses_fixed_qlib_license_when_wheel_omits_it(inputs, tmp_path, monkeypatch):
+    import ptop.bundle as bundle_module
+
+    original = bundle_module.distribution
+
+    class _NoLicenseMetadata:
+        files = []
+
+    monkeypatch.setattr(bundle_module, "distribution", lambda name: _NoLicenseMetadata() if name == "pyqlib" else original(name))
+    _, _, processor, _, _, _, mapping, _ = inputs
+    spec = _spec()
+    path = tmp_path / "bundle"
+    _save_bundle(path, create_score_model(spec), processor, mapping, spec, weight_format="torch")
+    assert (path / "licenses/pyqlib/LICENSE").read_bytes() == (path / "source/ptop/licenses/QLIB-MIT.txt").read_bytes()
+    assert "fixed-commit repository MIT license" in (path / "THIRD_PARTY.md").read_text()
+    load_bundle(path)
 
 
 def _training_update(model, optimizer, scheduler, scaler, batch):
@@ -437,6 +479,16 @@ def test_canonical_inference_never_refits_or_consumes_caller_rng(inputs, monkeyp
                                start_date="2024-01-03", end_date="2024-01-03", window_length=4)
     assert len(result.output) == 4 and processor.fingerprint == fingerprint
     assert torch.equal(rng, torch.random.get_rng_state())
+
+
+def test_external_a_loader_does_not_consume_caller_rng(inputs):
+    model = create_score_model(_spec())
+    evaluation = inputs[4]
+    dataset = WindowDataset(inputs[1], evaluation, inputs[5], length=4)
+    loader = DataLoader(dataset, batch_sampler=DecisionBatchSampler(dataset), collate_fn=collate_windows)
+    rng = torch.random.get_rng_state().clone()
+    result = predict_windows(model, loader, evaluation, start_date="2024-01-03", end_date="2024-01-03")
+    assert len(result.output) == 4 and torch.equal(rng, torch.random.get_rng_state())
 
 
 class _QueryRecorder:

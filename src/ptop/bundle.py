@@ -22,6 +22,9 @@ MODERN_BUNDLE_VERSION = 2
 MODERN_MODEL_NAMES = ("B-GRU", "B-Transformer", "B-TCN", "B-SelectiveSSM")
 ALL_MODEL_NAMES = MODEL_NAMES + MODERN_MODEL_NAMES
 REQUIRED_CONTRACTS = ("source", "sampling", "universe", "visibility", "label", "training_scope")
+QLIB_LICENSE_DIGEST = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+EXECUTION_MODULES = ("schema.py", "data.py", "windows.py", "preprocessing.py", "encoders.py", "models.py",
+                     "temporal.py", "backbones.py", "official.py", "output.py", "inference.py")
 
 
 def create_model(name: str):
@@ -56,6 +59,17 @@ def _digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             checksum.update(block)
     return checksum.hexdigest()
+
+
+def execution_signature() -> dict:
+    """Bind saved scores to the concrete A/B implementation, including equal-shape algorithms."""
+    package = Path(__file__).parent
+    try:
+        files = {f"ptop/{name}": _digest(package / name) for name in EXECUTION_MODULES}
+    except OSError as error:
+        raise ContractError("推理执行源码缺失，无法核对可复现实现") from error
+    fingerprint = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {"files": files, "fingerprint": fingerprint}
 
 
 def _validate_tensor_state(state: dict) -> None:
@@ -324,6 +338,13 @@ def _copy_portable_source(stage: Path, manifest: dict) -> list[str]:
             relative = f"source/{package}/{original.name}"
             shutil.copyfile(original, stage / relative)
             files.append(relative)
+    qlib_license = Path(__file__).parent / "licenses" / "QLIB-MIT.txt"
+    if not qlib_license.is_file() or _digest(qlib_license) != QLIB_LICENSE_DIGEST:
+        raise ContractError("固定 Qlib 上游许可文本缺失或被修改")
+    bundled_license = "source/ptop/licenses/QLIB-MIT.txt"
+    (stage / bundled_license).parent.mkdir(parents=True)
+    shutil.copyfile(qlib_license, stage / bundled_license)
+    files.append(bundled_license)
     environment = _portable_environment()
     _write_json(stage / "environment.json", environment)
     files.append("environment.json")
@@ -341,6 +362,7 @@ def _copy_portable_source(stage: Path, manifest: dict) -> list[str]:
                   f"# Dependency sources\n\nQlib source: https://github.com/microsoft/qlib/tree/{QLIB_COMMIT}\n")
     provenance += ("\n\n## Bundle dependency licenses\n\n"
                    "The dependency LICENSE/NOTICE files below are copied verbatim from installed distribution metadata. "
+                   f"If Qlib wheel metadata omits its MIT license, the verified repository copy from https://github.com/microsoft/qlib/blob/{QLIB_COMMIT}/LICENSE is used. "
                    "Qlib is locked to the commit recorded in manifest.json and environment.json. "
                    "Dependencies remain external installations; source/ contains this repository's ptop and jyc_e2e modules.\n")
     for name in manifest["dependencies"]:
@@ -361,7 +383,13 @@ def _copy_portable_source(stage: Path, manifest: dict) -> list[str]:
             files.append(relative)
             license_count += 1
             provenance += f"- {name} {manifest['dependencies'][name]}: `{relative}`\n"
-        if license_count == 0:
+        if license_count == 0 and name == "pyqlib":
+            relative = "licenses/pyqlib/LICENSE"
+            (stage / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(qlib_license, stage / relative)
+            files.append(relative)
+            provenance += f"- pyqlib {manifest['dependencies'][name]}: `{relative}` (verified fixed-commit repository MIT license)\n"
+        elif license_count == 0:
             raise ContractError(f"无法定位 {name} 的上游许可文本；请正确安装固定依赖")
     (stage / "THIRD_PARTY.md").write_text(provenance, encoding="utf-8")
     files.append("THIRD_PARTY.md")
@@ -433,7 +461,7 @@ def save_bundle(path, model, preprocessor: FrozenPreprocessor, *, model_name: st
         "model_name": spec["name"], "model_spec": spec, "window_length": window_length,
         "contracts": contracts, "seed": seed, "training_record": training_record,
         "instrument_map": [[int(key), value] for key, value in sorted(mapping.items())],
-        "weight_format": weight_format, "source_files": [],
+        "weight_format": weight_format, "source_files": [], "execution": execution_signature(),
     }
     json.dumps(manifest, allow_nan=False)
     portable = True if include_source is None else include_source
@@ -451,6 +479,9 @@ def save_bundle(path, model, preprocessor: FrozenPreprocessor, *, model_name: st
             manifest["source_files"] = _copy_portable_source(stage, manifest)
             files.extend(manifest["source_files"])
         manifest["files"] = {name: _digest(stage / name) for name in files}
+        if portable and any(manifest["files"][f"source/{name}"] != checksum
+                            for name, checksum in manifest["execution"]["files"].items()):
+            raise ContractError("保存过程中推理执行源码发生变化")
         _write_json(stage / "manifest.json", manifest)
 
     _atomic_directory(path, writer)
@@ -471,13 +502,15 @@ def load_bundle(path):
                 raise ContractError("模型包文件缺失或无法读取") from error
     required = {"bundle_version", "schema_version", "fields", "qlib_commit", "dependencies", "model_name",
                 "model_spec", "window_length", "contracts", "seed", "training_record", "instrument_map",
-                "files", "weight_format", "source_files"}
+                "files", "weight_format", "source_files", "execution"}
     if set(manifest) != required or manifest["bundle_version"] != MODERN_BUNDLE_VERSION:
         raise ContractError("模型包配置字段缺失、未知或版本不支持")
     if manifest["schema_version"] != SCHEMA_VERSION or manifest["fields"] != list(FEATURES):
         raise ContractError("模型包 schema 或字段顺序不一致")
     if manifest["qlib_commit"] != QLIB_COMMIT or manifest["dependencies"] != dependency_versions():
         raise ContractError("模型包 Qlib 来源或依赖版本与运行环境不一致")
+    if manifest["execution"] != execution_signature():
+        raise ContractError("模型包推理执行源码与当前实现不一致；请从携带的可信 source 复现")
     spec = _model_spec_dict(manifest["model_spec"])
     if (manifest["model_spec"] != spec or manifest["model_name"] != spec["name"] or type(manifest["window_length"]) is not int
             or manifest["window_length"] <= 0 or manifest["window_length"] != spec["lookback"]):
@@ -500,7 +533,7 @@ def load_bundle(path):
         raise ContractError("模型包携带源码清单无效")
     for name in portable_files:
         parts = Path(name).parts
-        code = len(parts) == 3 and parts[0] == "source" and parts[1] in ("ptop", "jyc_e2e") and parts[2].endswith(".py")
+        code = (len(parts) == 3 and parts[0] == "source" and parts[1] in ("ptop", "jyc_e2e") and parts[2].endswith(".py")) or name == "source/ptop/licenses/QLIB-MIT.txt"
         license_file = len(parts) >= 3 and parts[0] == "licenses" and parts[1] in manifest["dependencies"]
         metadata_file = name in ("requirements.txt", "environment.json", "THIRD_PARTY.md")
         if (name != str(Path(name)) or Path(name).is_absolute() or ".." in parts
@@ -509,6 +542,9 @@ def load_bundle(path):
     file_checksums = manifest["files"]
     if not isinstance(file_checksums, dict) or set(file_checksums) != {weight_name, "preprocessor.json", *portable_files}:
         raise ContractError("模型包文件清单不完整")
+    if portable_files and any(file_checksums.get(f"source/{name}") != checksum
+                              for name, checksum in manifest["execution"]["files"].items()):
+        raise ContractError("模型包携带源码与执行指纹不一致")
     for name, checksum in file_checksums.items():
         file = source / name
         if (not isinstance(checksum, str) or len(checksum) != 64 or file.is_symlink()

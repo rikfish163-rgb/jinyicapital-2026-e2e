@@ -16,7 +16,7 @@ import torch
 
 from .bundle import (
     _create_spec_model, _model_spec_dict, _validate_contracts, _validate_state_shapes,
-    _validated_model_state, dependency_versions,
+    _validated_model_state, dependency_versions, execution_signature,
 )
 from .preprocessing import FrozenPreprocessor
 from .schema import FEATURES, QLIB_COMMIT, SCHEMA_VERSION, ContractError
@@ -246,6 +246,7 @@ def save_checkpoint(path, model, optimizer, *, scheduler=None, scaler=None, epoc
         "epoch": epoch, "global_step": global_step, "best_metric": best_metric, "bad_epochs": bad_epochs,
         "config": config, "model_spec": spec, "contracts": dict(contracts), "split": split,
         "preprocessor": preprocessor.state_dict(),
+        "execution": execution_signature(),
         "trainable_parameters": [name for name, parameter in model.named_parameters() if parameter.requires_grad],
     }
     payload = {
@@ -282,7 +283,7 @@ def _read_checkpoint(path, *, map_location="cpu") -> dict:
     metadata = payload["metadata"]
     expected_keys = {"checkpoint_version", "schema_version", "fields", "qlib_commit", "dependencies", "epoch",
                      "global_step", "best_metric", "bad_epochs", "config", "model_spec", "contracts", "split",
-                     "preprocessor", "trainable_parameters"}
+                     "preprocessor", "trainable_parameters", "execution"}
     if not isinstance(metadata, dict) or set(metadata) != expected_keys:
         raise ContractError("checkpoint 元数据字段缺失或未知")
     if (type(metadata["checkpoint_version"]) is not int or metadata["checkpoint_version"] != CHECKPOINT_VERSION
@@ -291,6 +292,8 @@ def _read_checkpoint(path, *, map_location="cpu") -> dict:
         raise ContractError("checkpoint 版本、schema、Qlib 或字段顺序不一致")
     if metadata["dependencies"] != dependency_versions():
         raise ContractError("checkpoint 依赖版本与运行环境不一致")
+    if metadata["execution"] != execution_signature():
+        raise ContractError("checkpoint 推理执行源码与当前实现不一致")
     _validate_contracts(metadata["contracts"])
     if (_model_spec_dict(metadata["model_spec"]) != metadata["model_spec"]
             or not _json_data(metadata["config"], "config") or not _json_data(metadata["split"], "split")):

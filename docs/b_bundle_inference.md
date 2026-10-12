@@ -26,6 +26,10 @@ loaded_model, loaded_processor, manifest = load_bundle(output_path)
 
 v2 的 `model.pt` 只含张量状态，加载显式使用 `weights_only=True`；JSON 导出同样支持现代候选。`manifest.files` 的 SHA-256 覆盖权重、处理器、携带源码、环境快照和许可文本。加载严格检查 schema、字段顺序、Qlib 固定提交、依赖版本、合同、文件清单和校验和。缺少权重或不支持的配置直接失败。
 
+执行指纹另绑定 schema、数据、窗口、处理器、编码器、固定模型、现代模型、时序主干、官方输入、输出审核和推理这 11 个模块的实际文件。即使张量形状相同，本地算法源码改变也会拒绝加载；携带的核心源码须与此指纹一致。C 需要原实现时，在新 Python 进程中将可信 bundle 的 `source` 加入模块路径再加载。关闭源码携带仍会验证本地执行指纹。原 A v1 格式继续沿用其已有版本与合同检查。
+
+Qlib 的 wheel 配置可能省略许可文件，因此仓库另携带固定提交的逐字节 MIT 许可副本 `src/ptop/licenses/QLIB-MIT.txt`，打包前核对固定 SHA-256，并在 `THIRD_PARTY.md` 写明公开来源；其余核心依赖使用安装 distribution 中的 LICENSE/NOTICE。
+
 保存先完成合同检查，再在同一父目录暂存、同步文件并改名；已有 bundle 路径不能覆盖。每个训练 epoch 可使用独立目录。加载调用可信的本地模型工厂，不执行包内 Python 源码，也不会拟合处理器或安装依赖。携带源码可供审核和在预先安装依赖的环境复现；部署端自行将可信 `source` 加入 Python 模块路径。训练记录应保存运行命令、配置、数据范围和对应验证证据。
 
 ## 训练断点
@@ -58,7 +62,7 @@ generator.set_state(state.extra_state["sampler_generator"])
 
 `epoch` 表示已完成的 epoch 数，恢复后从下一轮继续；在 epoch 边界保存。断点包含完整模型与优化器状态、scheduler、AMP scaler、epoch/global_step/最佳指标/耐心计数、Python/NumPy/Torch CPU/CUDA 随机状态及确定性后端设置，另保存不可变配置、冻结处理器、模型配置、数据切分、schema、字段、Qlib 与依赖版本。
 
-优化器的每个参数组同时记录参数名称和顺序，恢复时严格匹配，避免 PyTorch 按位置给错层恢复动量。配置或数据切分不匹配、scheduler/scaler 启用配置变化、冻结统计变化都会在修改模型前失败。完整性校验同时覆盖张量和元数据。文件通过同目录临时文件、fsync 和原子替换保存；保存失败会清理临时文件。
+优化器的每个参数组同时记录参数名称和顺序，恢复时严格匹配，避免 PyTorch 按位置给错层恢复动量。配置或数据切分不匹配、scheduler/scaler 启用配置变化、冻结统计变化都会在修改模型前失败。完整性校验同时覆盖张量和元数据；断点也保存并校验与推理包相同的执行源码指纹。文件通过同目录临时文件、fsync 和原子替换保存；保存失败会清理临时文件。
 
 `config` 和 `split` 为有限 JSON 字典。`config` 保留最大训练轮数和 scheduler 总周期等不可变信息；暂时运行到第几轮属于进程控制参数。`extra_state` 可含普通字典/list/tuple、有限标量和稠密张量，用于训练历史、目标缩放、最佳轮次和 sampler generator。NumPy 数组、任意类实例及可执行对象不允许进入断点。使用独立 generator 的 DataLoader、sampler 或目标模块须显式保存并恢复其状态；不能用全局 RNG 状态替代它们的独立状态。
 
