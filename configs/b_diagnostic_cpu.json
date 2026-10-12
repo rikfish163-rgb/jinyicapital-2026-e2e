@@ -29,7 +29,7 @@
       "sampling": "explicit engineering endpoints on observed grid; not official sampling",
       "universe": "raw instrument IDs 11/16/19/30; no guessed symbol mapping",
       "visibility": "diagnostic assumption bar end equals available_at; production visibility unverified",
-      "label": "diagnostic-keyed-target.v1 SHA256 pseudo-targets; not financial returns or official labels",
+      "label": "diagnostic-keyed-target.v1",
       "training_scope": "diagnostic real bars with synthetic targets; engineering evidence only"
     }
   }

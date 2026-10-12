@@ -35,7 +35,8 @@ from .windows import LocalAuditWindowDataset, WindowBatch, WindowDataset, fit_ro
 
 
 CACHE_VERSION = 1
-DIAGNOSTIC_SCOPE = "diagnostic_real_bars_synthetic_targets"
+DIAGNOSTIC_SCOPE = "diagnostic"
+DIAGNOSTIC_DATA_SCOPE = "diagnostic_real_bars_synthetic_targets"
 _SAMPLE_COLUMNS = ["sample_id", "decision_id", "instrument_id", "decision_time"]
 
 
@@ -484,7 +485,8 @@ def _prepare(store: LocalBarStore, expected: pd.DataFrame, targets: pd.DataFrame
         fields=fields, instrument_map=instrument_map, scope=scope, bar_end_is_available=bar_end_is_available,
         scale_review=scale_review)
     keys = {"train": train_expected.sample_id.astype(str).tolist(), "validation": validation_expected.sample_id.astype(str).tolist()}
-    manifest = {"scope": scope, "diagnostic_notice": "Synthetic keyed targets are not official labels or evidence of financial predictability."
+    manifest = {"scope": scope, "data_scope": "official_explicit_contracts" if scope == "official" else DIAGNOSTIC_DATA_SCOPE,
+                "diagnostic_notice": "Synthetic keyed targets are not official labels or evidence of financial predictability."
                 if scope != "official" else None, "source_cache": store.manifest, "normalization": diagnostics,
                 "preprocessor_fingerprint": processor.fingerprint, "sampling_keys_fingerprint": _json_digest(keys),
                 "label_spec": vars(label_spec), "fold": {"name": fold.name, "train_start": fold.train_start.isoformat(),
