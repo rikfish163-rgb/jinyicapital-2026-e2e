@@ -370,6 +370,56 @@ def test_real_window_benchmark_reports_waits_and_memory_without_targets(local_fi
     assert metrics["peak_cuda_allocated_bytes"] is None
 
 
+@pytest.mark.parametrize("model_name", ["R0", "R1", "B-GRU"])
+def test_default_experiment_runner_trains_native_a_and_modern_b(local_fixture, tmp_path, model_name):
+    from ptop.checkpoint import _read_checkpoint, load_inference_checkpoint
+    from ptop.temporal import ModelSpec, create_score_model
+    from ptop.training import seed_everything
+
+    *_, store = local_fixture
+    prepared = prepare_diagnostic_fold(store, days=["2024-01-02", "2024-01-03", "2024-01-04"],
+        instrument_ids=[1, 2], validation_start="2024-01-04", endpoint_minutes=["09:32", "09:34"], window_length=4)
+    contracts = {name: "synthetic engineering check" for name in
+                 ("source", "sampling", "universe", "visibility", "training_scope")}
+    contracts["label"] = prepared.label_spec.version
+    plan = ExperimentPlan(({"name": model_name},), lookbacks=(4,), seeds=(7,),
+        training={"selection_metric": "loss", "mode": "min", "precision": "fp32", "microbatch_size": 2},
+        budget=ExperimentBudget(epochs=1, max_wall_seconds=30.0), contracts=contracts)
+    comparison = run_experiments(plan, prepared, output_dir=tmp_path / "native-default-runner")
+    assert comparison.status.tolist() == ["completed"], comparison.to_dict("records")
+    run = tmp_path / "native-default-runner" / comparison.run_id.iloc[0]
+    record = json.loads((run / "run.json").read_text())
+    checkpoint = _read_checkpoint(run / "last.pt")
+    assert checkpoint["metadata"]["epoch"] == 1 and checkpoint["metadata"]["global_step"] == 4
+    counts = record["parameter_counts"]
+    assert sum(counts.values()) == record["parameter_count"]
+    if model_name == "R0":
+        assert set(counts) == {"encoder", "rnn", "fc_out"} and counts["encoder"] == 0
+        assert counts["rnn"] > 0 and counts["fc_out"] > 0
+    elif model_name == "R1":
+        assert set(counts) == {"encoder", "rnn", "att_net", "fc_out"}
+        assert all(value > 0 for value in counts.values())
+    else:
+        assert all(counts[part] > 0 for part in ("encoder", "backbone", "head"))
+    assert record["tcn_receptive_field_tokens"] is None
+    seed_everything(7, deterministic=True)
+    initial = create_score_model(ModelSpec.from_dict(record["model_spec"]))
+    for part, count in counts.items():
+        if count:
+            assert any(not torch.equal(checkpoint["model"][name], value) for name, value in initial.state_dict().items()
+                       if name.startswith(part + "."))
+    restored, processor, _ = load_inference_checkpoint(run / "best.pt")
+    assert processor.fingerprint == prepared.processor.fingerprint
+    actual = {}
+    for batch in prepared.validation_loader():
+        with torch.no_grad():
+            score = restored(*(torch.as_tensor(value) for value in (batch.x, batch.observed, batch.step_valid)))
+        actual.update(zip(batch.metadata.sample_id, score.numpy()))
+    stored = pd.read_parquet(run / "comparison_predictions.parquet").set_index("sample_id")
+    assert len(stored) == 4 and stored.predictable.all() and stored.target_valid.all()
+    np.testing.assert_array_equal(pd.Series(actual).loc[stored.index].to_numpy(), stored.score.to_numpy())
+
+
 def test_cli_file_factories_require_official_contracts_and_preserve_explicit_fold(local_fixture, tmp_path, monkeypatch):
     source, _, mapping, expected, targets, spec, grid, fold, _ = local_fixture
     model_spec = SimpleNamespace(lookback=4)

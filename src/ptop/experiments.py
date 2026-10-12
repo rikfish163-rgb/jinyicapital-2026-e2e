@@ -161,6 +161,21 @@ class _BudgetPrepared:
         return self._bounded(self.prepared.validation_loader(), training=False)
 
 
+def _parameter_counts(model: torch.nn.Module) -> dict[str, int]:
+    """Count trainable parameters once, under their actual registered module.
+
+    Native A models expose rnn/att_net/fc_out while modern B models expose
+    backbone/pool/head. Keep zero-parameter modules (notably R0's raw encoder)
+    visible rather than inventing a learned encoder or architecture alias.
+    """
+    counts = {name: 0 for name, _ in model.named_children()}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            group = name.split(".", 1)[0] if "." in name else "__root__"
+            counts[group] = counts.get(group, 0) + parameter.numel()
+    return counts
+
+
 def _default_runner(request: ExperimentRequest, prepared: PreparedLocalFold, output_dir: Path) -> dict:
     # Imports are deferred so preparing and inspecting data does not load the Trainer.
     from .temporal import ModelSpec, create_score_model
@@ -192,9 +207,8 @@ def _default_runner(request: ExperimentRequest, prepared: PreparedLocalFold, out
             "validation_predictions": pd.read_parquet(prediction_path), "prediction_path": str(prediction_path),
             "best_checkpoint": str(result.best_checkpoint), "last_checkpoint": str(result.last_checkpoint),
             "parameter_count": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
-            "parameter_counts": {name: sum(parameter.numel() for parameter in getattr(model, name).parameters() if parameter.requires_grad)
-                                 for name in ("encoder", "backbone", "head")},
-            "tcn_receptive_field_tokens": getattr(model.backbone, "receptive_field", None)}
+            "parameter_counts": _parameter_counts(model),
+            "tcn_receptive_field_tokens": getattr(getattr(model, "backbone", None), "receptive_field", None)}
 
 
 def run_experiments(plan: ExperimentPlan, prepared: PreparedLocalFold, *, output_dir: str | Path,
