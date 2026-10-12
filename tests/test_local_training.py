@@ -14,7 +14,7 @@ import torch
 from ptop.data import concat_partitions
 from ptop.experiments import (ExperimentBudget, ExperimentBudgetExceeded, ExperimentPlan,
                               benchmark_windows, requests_for_plan, run_experiments)
-from ptop.local_training import (DIAGNOSTIC_SCOPE, LocalBarStore, ReadPolicy,
+from ptop.local_training import (DIAGNOSTIC_SCOPE, LocalBarStore, ReadPolicy, _ColumnReader, _pinned_pairwise_sum,
                                 diagnostic_training_factory, local_training_factory,
                                 prepare_diagnostic_fold, prepare_local_fold, split_local_targets)
 from ptop.preprocessing import FrozenPreprocessor
@@ -92,6 +92,59 @@ def test_partitioned_n1_equals_pinned_a_full_fit_and_validation_is_frozen(local_
     assert prepared.processor.fingerprint == before
     assert prepared.normalization_diagnostics["automatic_float32_finite_check"]
     assert prepared.normalization_diagnostics["implementation"].startswith("pooled_")
+
+
+def test_decimal_constant_fields_match_actual_a_ignore_with_asymmetric_partitions(local_fixture):
+    source, bars, mapping, expected, targets, spec, grid, fold, store = local_fixture
+    bars = bars.drop(index=1).reset_index(drop=True)  # First training day has seven rows.
+    bars["open"] = 946  # 9.46 is not exactly representable in binary float64.
+    bars["bid_price2"] = 2711
+    bars.loc[0, "bid_price2"] = 0  # Constant observed price, plus a missing cell.
+    extra = bars.loc[bars.date.eq(pd.Timestamp("2024-01-03 09:34"))].iloc[-1:].copy()
+    extra["instrument_id"] = 4
+    bars = pd.concat([bars, extra], ignore_index=True)  # Second training day has nine rows.
+    feather.write_feather(bars, source / "202401.0.feather", chunksize=4)
+    mapping = {**mapping, 4: "SYNTHETIC_EXTRA"}
+    expected = pd.concat([expected, pd.DataFrame([{"sample_id": "20240103T0934:4", "decision_id": "20240103T0934",
+        "decision_time": pd.Timestamp("2024-01-03 09:34"), "instrument_id": 4, "instrument": mapping[4]}])], ignore_index=True)
+    targets = pd.concat([targets, pd.DataFrame([{"sample_id": "20240103T0934:4", "target": 0.001, "target_valid": True,
+        "target_start": pd.Timestamp("2024-01-03 09:34"), "target_end": pd.Timestamp("2024-01-03 09:35"),
+        "label_spec_version": spec.version}])], ignore_index=True)
+    prepared = prepare_local_fold(store, expected, targets, label_spec=spec, trading_grid=grid, fold=fold,
+        instrument_map=mapping, window_length=4, scale_review="decimal constant numerical regression")
+    raw = concat_partitions([store.read_day(day, instrument_map=mapping) for day in pd.to_datetime(["2024-01-02", "2024-01-03"])])
+    windows = WindowDataset(raw, prepared.train_expected, grid, length=4)
+    references = fit_row_union(windows, fit_start=fold.train_start, fit_end="2024-01-03")
+    direct = FrozenPreprocessor("N1").fit(raw.values, raw.observed, referenced_rows=references,
+                                         fit_start=fold.train_start, fit_end="2024-01-03")
+    direct.freeze(scale_review="direct pinned A decimal-constant fit")
+    a, b = direct.state_dict(), prepared.processor.state_dict()
+    assert a["statistics"]["ignore"] == b["statistics"]["ignore"]
+    for field in ("open", "bid_price2"):
+        position = FEATURES.index(field)
+        assert a["statistics"]["center"][position] == b["statistics"]["center"][position]
+        assert a["statistics"]["scale"][position] == b["statistics"]["scale"][position]
+    assert a["fit_rows_fingerprint"] == b["fit_rows_fingerprint"]
+    assert "bid_price2" in prepared.normalization_diagnostics["constant_field_exact_reduction"]
+
+
+@pytest.mark.parametrize("size", [15, 129, 257, 12345, 100000])
+def test_bounded_constant_missing_reduction_matches_pinned_numpy_bitwise(tmp_path, size):
+    random = np.random.default_rng(7)
+    values = np.full(size, 9.46)
+    values[random.random(size) < 0.1] = 0.0
+    path = tmp_path / "constant-column.f64"
+    path.write_bytes(values.tobytes())
+    reader = _ColumnReader(path, size)
+    try:
+        actual = _pinned_pairwise_sum(reader, 0, size)
+        assert actual == np.sum(values)
+        center = float(actual / np.count_nonzero(values))
+        std = np.sqrt(_pinned_pairwise_sum(reader, 0, size, squared_center=center) / np.count_nonzero(values))
+        assert std == np.nanstd(np.where(values != 0, values, np.nan))
+        assert len(reader.buffer) <= 16384
+    finally:
+        reader.close()
 
 
 def test_day_loader_visible_slots_empty_official_symbols_and_raw_only_cache(local_fixture):
@@ -204,7 +257,7 @@ def test_target_support_at_split_boundary_is_purged_without_deleting_keys():
     assert pd.isna(train.target.iloc[0]) and pd.isna(validation.target.iloc[1])
 
 
-def test_experiment_scheduler_locks_keys_labels_scaler_and_independent_budget(local_fixture, tmp_path):
+def test_experiment_scheduler_locks_keys_labels_scaler_and_independent_budget(local_fixture, tmp_path, monkeypatch):
     prepared = _prepared(local_fixture)
     plan = ExperimentPlan(({"name": "model-a"}, {"name": "model-b"}), lookbacks=(2, 4), seeds=(7, 17),
                           budget=ExperimentBudget(epochs=2, max_wall_seconds=30.0))
@@ -248,6 +301,9 @@ def test_experiment_scheduler_locks_keys_labels_scaler_and_independent_budget(lo
     exceeded = run_experiments(replace(plan, lookbacks=(4,), seeds=(7,)), prepared,
         output_dir=tmp_path / "exceeded", runner=over_budget)
     assert exceeded.status.eq("budget_exceeded").all()
+    monkeypatch.setattr("ptop.experiments._experiment_implementation_contract", lambda: {"algorithm": "changed"})
+    with pytest.raises(ContractError, match="固定计划"):
+        run_experiments(plan, prepared, output_dir=tmp_path / "grid", runner=runner, resume_completed=True)
 
 
 def test_real_window_benchmark_reports_waits_and_memory_without_targets(local_fixture):
@@ -292,5 +348,5 @@ def test_cli_file_factories_require_official_contracts_and_preserve_explicit_fol
 
 
 def test_experiment_seed_range_matches_training_config():
-    with pytest.raises(ContractError, match="2\*\*32"):
+    with pytest.raises(ContractError, match=r"2\*\*32"):
         ExperimentPlan(({"name": "test"},), seeds=(2**32,))

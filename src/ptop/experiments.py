@@ -109,6 +109,12 @@ def _target_fingerprint(frame: pd.DataFrame) -> str:
     return hashlib.sha256(pd.util.hash_pandas_object(owned, index=False).to_numpy().tobytes()).hexdigest()
 
 
+def _experiment_implementation_contract() -> dict:
+    from .training import _implementation_contract
+
+    return {**_implementation_contract(), "experiments": _file_digest(Path(__file__))}
+
+
 def requests_for_plan(plan: ExperimentPlan) -> tuple[ExperimentRequest, ...]:
     requests = []
     for candidate in plan.model_specs:
@@ -185,7 +191,10 @@ def _default_runner(request: ExperimentRequest, prepared: PreparedLocalFold, out
             "metrics": best["validation"], "history": history,
             "validation_predictions": pd.read_parquet(prediction_path), "prediction_path": str(prediction_path),
             "best_checkpoint": str(result.best_checkpoint), "last_checkpoint": str(result.last_checkpoint),
-            "parameter_count": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)}
+            "parameter_count": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+            "parameter_counts": {name: sum(parameter.numel() for parameter in getattr(model, name).parameters() if parameter.requires_grad)
+                                 for name in ("encoder", "backbone", "head")},
+            "tcn_receptive_field_tokens": getattr(model.backbone, "receptive_field", None)}
 
 
 def run_experiments(plan: ExperimentPlan, prepared: PreparedLocalFold, *, output_dir: str | Path,
@@ -206,7 +215,8 @@ def run_experiments(plan: ExperimentPlan, prepared: PreparedLocalFold, *, output
                 "preprocessor_fingerprint": prepared.processor.fingerprint,
                 "train_targets_fingerprint": _target_fingerprint(prepared.train_targets),
                 "validation_targets_fingerprint": _target_fingerprint(prepared.validation_targets),
-                "fields": list(prepared.fields), "label_spec": vars(prepared.label_spec), "fold": prepared.manifest["fold"]}
+                "fields": list(prepared.fields), "label_spec": vars(prepared.label_spec), "fold": prepared.manifest["fold"],
+                "implementation": _experiment_implementation_contract()}
     identity = {"plan": plan.to_dict(), "protocol": protocol}
     plan_path = destination / "plan.json"
     if plan_path.exists() and json.loads(plan_path.read_text(encoding="utf-8")) != identity:
@@ -275,6 +285,8 @@ def run_experiments(plan: ExperimentPlan, prepared: PreparedLocalFold, *, output
                 _target_fingerprint(prepared.train_targets) != protocol["train_targets_fingerprint"] or
                 _target_fingerprint(prepared.validation_targets) != protocol["validation_targets_fingerprint"]):
                 raise ContractError("runner 改变了共同冻结 N1 或目标表")
+            if _experiment_implementation_contract() != protocol["implementation"]:
+                raise ContractError("执行源码在矩阵运行期间改变；请用当前固定实现开启独立实验目录")
             # Save the checked complete frame even for custom runners.
             prediction_path = path / "comparison_predictions.parquet"
             predictions.to_parquet(prediction_path, index=False)
@@ -308,6 +320,8 @@ def _summary_frame(records: list[dict]) -> pd.DataFrame:
         for name, value in record.get("metrics", {}).items():
             if value is None or isinstance(value, (int, float, bool, np.number)):
                 row[f"validation_{name}"] = value
+        for name, value in record.get("parameter_counts", {}).items():
+            row[f"parameters_{name}"] = value
         rows.append(row)
     return pd.DataFrame(rows)
 

@@ -25,6 +25,8 @@ N1 只使用训练端点可见的唯一原始行。每一天先通过 A 的 `fit
 
 模型对比先用最长窗口拟合一份共同 N1，再用 `prepared.with_window(60)` 和 `prepared.with_window(120)`。所有候选保持相同采样键、目标有效性和目标值。调度器核验每次验证产物的完整 sample_id 集合、实际窗口 predictable 和有效预测键；不同覆盖不会被悄悄取交集。
 
+对于浮点常量，简单按日汇合的舍入误差可能改变 Qlib 严格 `std==0` 的 ignore。实现额外保留精确常量归约：无缺失时使用虚拟 broadcast view，带缺失时将一列临时写入私人磁盘，采用最多 16,384 个元素的读取缓冲和原生 NumPy 叶归约，临时文件随拟合完成删除。排序与划分依据固定 [NumPy 2.2.6 pairwise reduction](https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/umath/loops_utils.h.src)；实际算术由同版本 NumPy 执行。测试覆盖不对称分区中的货币常量及带缺失常量，不能仅用整数零字段证明等价。
+
 `ReadPolicy` 默认拒绝未知负值。下载文件中的盘口委托笔数是有符号 int16；显式 `negative_order_policy="mask_known"` 时，仅六个 `*_num_orders{1,2,3}` 的负值会改为缺失并计入读取审计。不会取绝对值、转换 uint16、加 65536 或推测原值。价格、金额和成交量等其他负值继续由 A 拒绝。正数笔数保持真实值，缺失 mask 继续进入 encoder。
 
 可以在固定训练依赖环境执行真实行情工程诊断：
@@ -40,6 +42,8 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH=src /home/data4/hts/jyc2026_training_env/bin/
 诊断目标是 sample_id 的 SHA256 映射到固定数值，**不是未来收益，不是官方标签，诊断 loss/IC 不代表金融预测效果**。默认矩阵为同一个 A ALSTM encoder 的 B-GRU、B-Transformer、B-TCN、B-SelectiveSSM，L=60/120、seeds=7/17/29，各 2 epochs、独立 600 秒预算。可用 `--models`、`--lookbacks`、`--seeds` 和 `--epochs` 选择有明确独立预算的子矩阵。
 
 产物位于私人 output_dir：`prepared_manifest.json`、`normalization.json`、`split_audit.parquet`、真实读取/前向的 `benchmark.json`，以及 matrix 下的训练日志、checkpoint、完整验证结果、`comparison.csv`、`seed_summary.csv` 和 `report.md`。报告明确区分已完成、失败和预算超限；超限不替换成更简单模型，只有上一完整 epoch 的 checkpoint 保证可恢复。`--resume-completed` 会验证已完成实验的协议和验证文件哈希后跳过。
+
+计划协议同时锁定 A/B 执行源码 SHA256；旧实现的结果不能在修改算法后无声当作当前已完成实验。模型记录实际总参数和 encoder/backbone/head 参数数，不把相同 width/layers 误称为相同容量。TCN 感受野与池化方式应一同阅读；默认 mean pooling 汇总整个有效窗口中的局部卷积结果。
 
 benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞吐和内存。CUDA 测量显式同步并重置分配峰值；CPU RSS 是整个进程的累计峰值，不冒称为某一个模型独立占用。没有官方标签时不计算或宣称平台 BARRA、压力场景、换手百分位或五项总分。
 

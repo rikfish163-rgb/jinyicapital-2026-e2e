@@ -287,6 +287,92 @@ def _window_dataset(raw: CanonicalData, expected: pd.DataFrame, grid: pd.Datetim
     return cls(raw, expected, grid, length=length, fields=fields, bar_end_is_available=bar_end_is_available)
 
 
+class _ColumnReader:
+    """Read a sequential reduction with a bounded buffer, not a full mmap."""
+
+    def __init__(self, path: Path, size: int):
+        self.file = path.open("rb")
+        self.size, self.begin = size, -1
+        self.buffer = np.empty(0, dtype=np.float64)
+
+    def read(self, begin: int, size: int) -> np.ndarray:
+        if begin < self.begin or begin + size > self.begin + len(self.buffer):
+            self.file.seek(begin * 8)
+            self.buffer = np.frombuffer(self.file.read(min(16384, self.size - begin) * 8), dtype=np.float64)
+            self.begin = begin
+        return self.buffer[begin - self.begin:begin - self.begin + size]
+
+    def close(self) -> None:
+        self.file.close()
+
+
+def _pinned_pairwise_sum(reader: _ColumnReader, begin: int, size: int, *, squared_center: float | None = None) -> np.float64:
+    """Match NumPy 2.2.6 fast-axis reduction using bounded native leaves.
+
+    The split boundary comes from NumPy's published pairwise algorithm; each
+    leaf's actual arithmetic stays in NumPy. Missing values were written as
+    zero. This helper is only needed for otherwise constant fields whose tiny
+    floating roundoff can change Qlib's exact ``std == 0`` ignore flag.
+    """
+    if size <= 128:
+        values = reader.read(begin, size)
+        if squared_center is not None:
+            values = np.where(values != 0, (values - squared_center) ** 2, 0.0)
+        return np.sum(values, dtype=np.float64)
+    half = size // 2
+    half -= half % 8
+    return (_pinned_pairwise_sum(reader, begin, half, squared_center=squared_center) +
+            _pinned_pairwise_sum(reader, begin + half, size - half, squared_center=squared_center))
+
+
+def _constant_column_statistics(store, train_expected, trading_grid, *, columns, first, count, fit_count,
+                                fold, window_length, fields, instrument_map, scope, bar_end_is_available):
+    """Preserve pinned Qlib roundoff/ignore even for decimal constants."""
+    output, missing_columns = {}, []
+    for column in columns:
+        if first[column] == 0:
+            output[column] = (0.0, 0.0)
+        elif count[column] == fit_count:
+            view = np.broadcast_to(np.asarray(first[column], dtype=np.float64), (fit_count,))
+            center = float(np.mean(view))
+            variance_view = np.broadcast_to(np.asarray((first[column] - center) ** 2), (fit_count,))
+            output[column] = (center, float(np.sqrt(np.mean(variance_view))))
+        else:
+            missing_columns.append(column)
+    if not missing_columns:
+        return output
+    if np.__version__ != "2.2.6":
+        raise ContractError("带缺失的常量字段精确 N1 归约需锁定 NumPy 2.2.6；不能静默改变 Qlib ignore 语义")
+    with tempfile.TemporaryDirectory(prefix="n1-constant-columns-", dir=store.cache_dir) as directory:
+        paths = {column: Path(directory) / f"{column}.f64" for column in missing_columns}
+        streams = {column: path.open("wb") for column, path in paths.items()}
+        fit_start = fold.train_start.normalize()
+        fit_end = (fold.validation_start - pd.Timedelta(nanoseconds=1)).normalize()
+        try:
+            for day, samples in train_expected.groupby(train_expected.decision_time.dt.normalize(), sort=True):
+                raw = store.read_day(day, instrument_map=instrument_map, bar_end_is_available=bar_end_is_available)
+                windows = _window_dataset(raw, samples, trading_grid, length=window_length, fields=fields, scope=scope,
+                                          bar_end_is_available=bar_end_is_available)
+                references = fit_row_union(windows, fit_start=fit_start, fit_end=fit_end)
+                for column in missing_columns:
+                    values = raw.values.loc[references, FEATURES[column]].to_numpy(dtype=np.float64)
+                    streams[column].write(np.nan_to_num(values, nan=0.0).tobytes())
+        finally:
+            for stream in streams.values():
+                stream.close()
+        for column, path in paths.items():
+            if path.stat().st_size != fit_count * 8:
+                raise ContractError("常量列归约引用行数不一致")
+            reader = _ColumnReader(path, fit_count)
+            try:
+                center = float(_pinned_pairwise_sum(reader, 0, fit_count) / count[column])
+                std = float(np.sqrt(_pinned_pairwise_sum(reader, 0, fit_count, squared_center=center) / count[column]))
+                output[column] = (center, std)
+            finally:
+                reader.close()
+    return output
+
+
 def fit_partitioned_n1(store: LocalBarStore, train_expected: pd.DataFrame, trading_grid: pd.DatetimeIndex,
                        *, fold: TimeFold, window_length: int, fields: Sequence[str] = FEATURES,
                        instrument_map: Mapping[int, str] | None = None, scope: str = "official",
@@ -332,6 +418,12 @@ def fit_partitioned_n1(store: LocalBarStore, train_expected: pd.DataFrame, tradi
         empty = [name for name, n in zip(FEATURES, count) if n == 0]
         raise ContractError(f"训练可见引用行没有完整 N1 拟合观测：{empty}")
     scale = np.sqrt(m2 / count)
+    constant_columns = np.flatnonzero(minima == maxima).tolist()
+    exact_constants = _constant_column_statistics(store, train_expected, trading_grid, columns=constant_columns,
+        first=first, count=count, fit_count=fit_count, fold=fold, window_length=window_length, fields=fields,
+        instrument_map=instrument_map, scope=scope, bar_end_is_available=bar_end_is_available)
+    for column, (center, std) in exact_constants.items():
+        mean[column], scale[column] = center, std
     ignored = scale == 0
     constants = {name: float(value) for name, value, ignore in zip(FEATURES, first, ignored) if ignore}
     mean[ignored], scale[ignored] = 0.0, 1.0
@@ -350,6 +442,8 @@ def fit_partitioned_n1(store: LocalBarStore, train_expected: pd.DataFrame, tradi
                                       "center": float(center), "scale": float(std), "zero_variance_training": bool(ignore)}
                               for name, n, low, high, center, std, ignore in zip(FEATURES, count, minima, maxima, mean, scale, ignored)},
                    "scale_review": scale_review, "scope": scope, "automatic_float32_finite_check": False}
+    diagnostics["constant_field_exact_reduction"] = [FEATURES[column] for column in constant_columns]
+    diagnostics["constant_reduction_reference"] = "NumPy 2.2.6 fast-axis pairwise sums; bounded 16384-element buffer"
     # Check A's exact frozen transform on every training partition, without gathering days.
     for day, samples in train_expected.groupby(train_expected.decision_time.dt.normalize(), sort=True):
         raw = store.read_day(day, instrument_map=instrument_map, bar_end_is_available=bar_end_is_available)
