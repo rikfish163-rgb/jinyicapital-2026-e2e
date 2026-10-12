@@ -201,6 +201,9 @@ def test_negative_order_mask_is_opt_in_and_other_negatives_remain_errors(local_f
     assert np.isnan(raw.values.iloc[0][BOOK_ORDER_FIELDS[0]])
     assert raw.values.iloc[1][BOOK_ORDER_FIELDS[0]] > 32767
     assert masking.profile["masked_negative_orders"][BOOK_ORDER_FIELDS[0]] == 1
+    masking.read_day("2024-01-02")
+    assert masking.anomaly_counts_by_day["2024-01-02"][BOOK_ORDER_FIELDS[0]] == 1
+    assert masking.profile["masked_negative_orders"][BOOK_ORDER_FIELDS[0]] == 2
     bars.loc[0, "volume"] = -1
     feather.write_feather(bars, source / "202401.0.feather", chunksize=4)
     masking.materialize(["2024-01-02"], [1, 2])

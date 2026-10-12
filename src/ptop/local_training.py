@@ -18,7 +18,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
@@ -28,10 +28,11 @@ import pyarrow.ipc as ipc
 
 from .data import CanonicalData, _timestamps, _validate_mapping, normalize_bars, normalize_local_bars
 from .official import official_targets
-from .preprocessing import FrozenPreprocessor
 from .schema import BOOK_ORDER_FIELDS, FEATURES, QLIB_COMMIT, ContractError
 from .targets import LabelSpec, TimeFold, attach_targets
-from .windows import LocalAuditWindowDataset, WindowBatch, WindowDataset, fit_row_union
+if TYPE_CHECKING:
+    from .preprocessing import FrozenPreprocessor
+    from .windows import WindowBatch
 
 
 CACHE_VERSION = 1
@@ -107,6 +108,7 @@ class LocalBarStore:
         self.manifest: dict | None = None
         self._scope_dir: Path | None = None
         self._verified_days: set[str] = set()
+        self.anomaly_counts_by_day: dict[str, dict[str, int]] = {}
         self.profile = {"read_calls": 0, "read_seconds": 0.0, "rows_read": 0, "max_day_rows_read": 0,
                         "masked_negative_orders": {name: 0 for name in BOOK_ORDER_FIELDS}}
 
@@ -147,6 +149,8 @@ class LocalBarStore:
             raise ContractError("私人 raw cache 身份与请求数据不一致")
         if set(manifest.get("partitions", {})) != set(identity["days"]):
             raise ContractError("私人 raw cache 分区清单不完整")
+        if self.manifest is None or self.manifest["identity"] != identity:
+            self.anomaly_counts_by_day = {}
         self.manifest, self._scope_dir = manifest, scope_dir
         self._verified_days.clear()
         return manifest
@@ -240,13 +244,16 @@ class LocalBarStore:
             frame = ipc.open_file(file).read_all().to_pandas()
         if len(frame) != entry["rows"] or len(frame) > self.policy.max_day_rows:
             raise ContractError("私人 raw cache 行数与预算或清单不一致")
-        if self.policy.negative_order_policy == "mask_known":
-            for name in BOOK_ORDER_FIELDS:
-                invalid = frame[name].lt(0)
-                count = int(invalid.sum())
+        counts = {}
+        for name in BOOK_ORDER_FIELDS:
+            invalid = frame[name].lt(0)
+            count = int(invalid.sum())
+            counts[name] = count
+            if self.policy.negative_order_policy == "mask_known":
                 self.profile["masked_negative_orders"][name] += count
                 if count:
                     frame[name] = frame[name].astype(np.float64).mask(invalid)
+        self.anomaly_counts_by_day[key] = counts
         normalizer = normalize_local_bars if instrument_map is None else normalize_bars
         kwargs = {"bar_end_is_available": bar_end_is_available}
         if instrument_map is not None:
@@ -283,6 +290,8 @@ def split_local_targets(expected: pd.DataFrame, targets: pd.DataFrame, label_spe
 
 def _window_dataset(raw: CanonicalData, expected: pd.DataFrame, grid: pd.DatetimeIndex, *,
                     length: int, fields: Sequence[str], scope: str, bar_end_is_available: bool):
+    from .windows import LocalAuditWindowDataset, WindowDataset
+
     cls = WindowDataset if scope == "official" else LocalAuditWindowDataset
     return cls(raw, expected, grid, length=length, fields=fields, bar_end_is_available=bar_end_is_available)
 
@@ -328,6 +337,8 @@ def _pinned_pairwise_sum(reader: _ColumnReader, begin: int, size: int, *, square
 def _constant_column_statistics(store, train_expected, trading_grid, *, columns, first, count, fit_count,
                                 fold, window_length, fields, instrument_map, scope, bar_end_is_available):
     """Preserve pinned Qlib roundoff/ignore even for decimal constants."""
+    from .windows import fit_row_union
+
     output, missing_columns = {}, []
     for column in columns:
         if first[column] == 0:
@@ -384,6 +395,9 @@ def fit_partitioned_n1(store: LocalBarStore, train_expected: pd.DataFrame, tradi
     No complete multi-year DataFrame is constructed. This is a streaming
     implementation, not a claim that A's full-table ``fit`` was called.
     """
+    from .preprocessing import FrozenPreprocessor
+    from .windows import fit_row_union
+
     if not isinstance(scale_review, str) or not scale_review.strip():
         raise ContractError("必须提供真实 scale_review，自动数值检查不能冒称人工审阅")
     count = np.zeros(len(FEATURES), dtype=np.int64)
@@ -587,6 +601,7 @@ def _prepare(store: LocalBarStore, expected: pd.DataFrame, targets: pd.DataFrame
                 "validation_start": fold.validation_start.isoformat(), "validation_end": fold.validation_end.isoformat()},
                 "window_length": window_length, "fit_window_length": fit_length, "fields": list(fields), "seed": seed,
                 "negative_order_policy": store.policy.negative_order_policy, "bar_end_is_available": bar_end_is_available}
+    manifest["negative_order_cells_by_loaded_day"] = {key: dict(value) for key, value in store.anomaly_counts_by_day.items()}
     prepared = PreparedLocalFold(processor, store, train_expected, validation_expected, train, validation, audit,
         trading_grid, fold, label_spec, scope, window_length, fit_length, tuple(fields), seed, bar_end_is_available,
         dict(instrument_map) if instrument_map is not None else None, diagnostics, manifest)

@@ -52,3 +52,5 @@ benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞�
 统一 `.py` CLI 也可选择 `data_factory="ptop.local_training:local_training_factory"`，data 中填写上述官方文件路径及私人 cache_dir；正式 factory 的窗口字段取真实 model.encoder.fields。工程诊断可运行 `python -m ptop.train --config configs/b_train_cli_diagnostic.json --output /私人目录/cli-smoke --device cpu --threads 2`。此配置显式选择 `diagnostic_training_factory`，输出可恢复训练 checkpoint，但不导出包含假股票代码的正式模型包。
 
 当前验证记录将由真实运行追加；只有确实执行并检查的结果才写入实验结论。
+
+第一轮实际读取检查已在 pandas 2.2.3 / NumPy 2.2.6 / Arrow 20.0.0 环境执行。202001 月文件被流式拆出所选三日和四个原始 ID，每日 1,000 行、25 字段、24,808 个有效观测；没有股票代码映射，六个委托笔数字段在此范围没有负值。月拆分耗时约 0.58 秒，三日 A 规范化读取约 0.076 秒，进程累计 RSS 峰值约 291 MiB。这是实际 raw 分区与 A 规范化检查，未执行 N1/训练的阶段不能当作训练验证通过。私人记录：`/home/data4/hts/jyc2026/b_work/b_ingest_read_probe/report.json`。
