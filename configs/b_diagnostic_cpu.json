@@ -24,6 +24,13 @@
     "training": {"learning_rate": 0.0003, "patience": 3, "selection_metric": "loss", "mode": "min", "precision": "fp32", "microbatch_size": 4},
     "budget": {"epochs": 2, "max_wall_seconds": 600.0, "max_train_batches": null},
     "device": "cpu",
-    "contracts": {}
+    "contracts": {
+      "source": "local authorized bar1m; diagnostic 20200102/03/06 only",
+      "sampling": "explicit engineering endpoints on observed grid; not official sampling",
+      "universe": "raw instrument IDs 11/16/19/30; no guessed symbol mapping",
+      "visibility": "diagnostic assumption bar end equals available_at; production visibility unverified",
+      "label": "diagnostic-keyed-target.v1 SHA256 pseudo-targets; not financial returns or official labels",
+      "training_scope": "diagnostic real bars with synthetic targets; engineering evidence only"
+    }
   }
 }

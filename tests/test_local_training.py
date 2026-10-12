@@ -3,6 +3,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from ptop.data import concat_partitions
 from ptop.experiments import (ExperimentBudget, ExperimentBudgetExceeded, ExperimentPlan,
                               benchmark_windows, requests_for_plan, run_experiments)
 from ptop.local_training import (DIAGNOSTIC_SCOPE, LocalBarStore, ReadPolicy,
+                                diagnostic_training_factory, local_training_factory,
                                 prepare_diagnostic_fold, prepare_local_fold, split_local_targets)
 from ptop.preprocessing import FrozenPreprocessor
 from ptop.schema import BOOK_ORDER_FIELDS, FEATURES, ContractError
@@ -260,3 +262,35 @@ def test_real_window_benchmark_reports_waits_and_memory_without_targets(local_fi
     assert metrics["data_wait_seconds"] > 0 and metrics["forward_seconds"] > 0
     assert metrics["peak_rss_bytes_process"] > 0 and metrics["samples_per_second"] > 0
     assert metrics["peak_cuda_allocated_bytes"] is None
+
+
+def test_cli_file_factories_require_official_contracts_and_preserve_explicit_fold(local_fixture, tmp_path, monkeypatch):
+    source, _, mapping, expected, targets, spec, grid, fold, _ = local_fixture
+    model_spec = SimpleNamespace(lookback=4)
+    with pytest.raises(ContractError, match="正式 data_factory 缺少"):
+        local_training_factory(config={"data_dir": str(source)}, model_spec=model_spec, fold=fold)
+    monkeypatch.setattr("ptop.local_training._factory_fields", lambda spec: FEATURES)
+    expected_path, target_path = tmp_path / "expected.parquet", tmp_path / "targets.parquet"
+    expected.to_parquet(expected_path, index=False)
+    targets.to_parquet(target_path, index=False)
+    mapping_path = tmp_path / "instrument_map.json"
+    mapping_path.write_text(json.dumps(mapping))
+    grid_path = tmp_path / "grid.csv"
+    pd.DataFrame({"datetime": grid}).to_csv(grid_path, index=False)
+    config = {"data_dir": str(source), "cache_dir": str(tmp_path / "factory_cache"),
+              "expected_path": str(expected_path), "targets_path": str(target_path),
+              "instrument_map_path": str(mapping_path), "grid_path": str(grid_path), "label_spec": vars(spec)}
+    prepared, returned_mapping = local_training_factory(config=config, model_spec=model_spec, fold=fold)
+    assert returned_mapping == mapping and prepared.scope == "official"
+    assert next(iter(prepared.validation_loader())).x.shape == (3, 4, 25)
+    diagnostic_config = {"scope": "diagnostic", "data_dir": str(source), "cache_dir": str(tmp_path / "diagnostic_factory_cache"),
+                         "days": ["2024-01-02", "2024-01-03", "2024-01-04"], "instrument_ids": [1, 2],
+                         "endpoint_minutes": ["09:32", "09:34"]}
+    diagnostic, absent_mapping = diagnostic_training_factory(config=diagnostic_config, model_spec=model_spec, fold=fold)
+    assert absent_mapping is None and diagnostic.scope == DIAGNOSTIC_SCOPE
+    assert diagnostic.fold.name == fold.name and diagnostic.manifest["fold"]["name"] == fold.name
+
+
+def test_experiment_seed_range_matches_training_config():
+    with pytest.raises(ContractError, match="2\*\*32"):
+        ExperimentPlan(({"name": "test"},), seeds=(2**32,))

@@ -434,8 +434,8 @@ class PreparedLocalFold:
         if not selected or len(set(selected)) != len(selected) or not set(selected).issubset(FEATURES):
             raise ContractError("模型字段必须为 raw25 非空无重复子集")
         selected_seed = self.seed if seed is None else seed
-        if type(selected_seed) is not int or not 0 <= selected_seed < 2**63:
-            raise ContractError("seed 必须为 [0, 2**63) 范围内整数")
+        if type(selected_seed) is not int or not 0 <= selected_seed < 2**32:
+            raise ContractError("seed 必须为 [0, 2**32) 范围内整数，与 TrainingConfig 一致")
         return replace(self, window_length=length, fields=tuple(selected), seed=selected_seed,
                        manifest={**self.manifest, "window_length": length, "fields": list(selected), "seed": selected_seed})
 
@@ -469,8 +469,8 @@ def _prepare(store: LocalBarStore, expected: pd.DataFrame, targets: pd.DataFrame
         raise ContractError("全部决策端点必须在显式分钟网格内")
     if not fields or len(set(fields)) != len(fields) or not set(fields).issubset(FEATURES):
         raise ContractError("模型字段必须为 raw25 非空无重复子集")
-    if type(seed) is not int or not 0 <= seed < 2**63:
-        raise ContractError("seed 必须为 [0, 2**63) 范围内整数")
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ContractError("seed 必须为 [0, 2**32) 范围内整数，与 TrainingConfig 一致")
     train, validation, audit = split_local_targets(expected, targets, label_spec, fold)
     columns = _SAMPLE_COLUMNS + (["instrument"] if scope == "official" else [])
     train_expected, validation_expected = train[columns].copy(), validation[columns].copy()
@@ -585,3 +585,95 @@ def prepare_diagnostic_fold(store: LocalBarStore, *, days: Iterable, instrument_
         fold=fold, instrument_map=None, scope=DIAGNOSTIC_SCOPE, window_length=window_length, fit_window_length=fit_window_length,
         fields=fields, seed=seed, bar_end_is_available=bar_end_is_available,
         scale_review="diagnostic-only:streaming-N1-automatic-finite-check; manual-scale-review-skipped")
+
+
+def _read_contract_table(path: str | Path | None, name: str) -> pd.DataFrame:
+    if not path or not Path(path).is_file():
+        raise ContractError(f"请提供存在的官方 {name} 文件：{path}")
+    source = Path(path)
+    if source.suffix == ".parquet":
+        return pd.read_parquet(source)
+    if source.suffix in {".feather", ".arrow"}:
+        return pd.read_feather(source)
+    if source.suffix == ".csv":
+        return pd.read_csv(source)
+    raise ContractError(f"官方 {name} 文件应为 parquet、feather 或 csv")
+
+
+def _factory_fields(model_spec) -> tuple[str, ...]:
+    # Ask the actual model for its encoder fields while preserving caller RNG.
+    import torch
+    from .temporal import create_score_model
+
+    with torch.random.fork_rng(devices=[]):
+        return tuple(create_score_model(model_spec).encoder.fields)
+
+
+def local_training_factory(*, config: dict, model_spec, fold: TimeFold) -> tuple[PreparedLocalFold, dict[int, str]]:
+    """``python -m ptop.train`` official data_factory for explicit local files.
+
+    ``config`` is the CLI's ``data`` dict. Paths are never inferred from raw bars.
+    Required keys: data_dir, cache_dir, expected_path, instrument_map_path,
+    grid_path, label_spec and targets_path (or labels_path plus support_path).
+    """
+    if not isinstance(config, dict) or config.get("scope", "official") != "official":
+        raise ContractError("local_training_factory 仅接收正式官方合同；诊断请显式用 diagnostic_training_factory")
+    required = ("data_dir", "cache_dir", "expected_path", "instrument_map_path", "grid_path", "label_spec")
+    missing = [name for name in required if not config.get(name)]
+    if not config.get("targets_path") and not (config.get("labels_path") and config.get("support_path")):
+        missing.append("targets_path or labels_path + support_path")
+    if missing:
+        raise ContractError("正式 data_factory 缺少 " + ", ".join(missing) + "；不能用四频率原始行情推测官方合同")
+    entries = json.loads(Path(config["instrument_map_path"]).read_text(encoding="utf-8"))
+    if not isinstance(entries, dict):
+        raise ContractError("instrument_map_path 必须为 JSON ID 到股票代码字典")
+    try:
+        mapping = {int(key): value for key, value in entries.items()}
+    except (ValueError, TypeError) as exc:
+        raise ContractError("股票映射 JSON 的键必须为显式整数 ID") from exc
+    if len(mapping) != len(entries):
+        raise ContractError("股票映射包含等价重复整数 ID")
+    mapping = _validate_mapping(mapping)
+    expected = _read_contract_table(config["expected_path"], "expected keys")
+    grid_frame = _read_contract_table(config["grid_path"], "trading_grid")
+    column = config.get("grid_column", "datetime")
+    if column not in grid_frame:
+        raise ContractError(f"官方网格文件缺少显式时间列 {column}")
+    grid = pd.DatetimeIndex(pd.to_datetime(grid_frame[column], errors="raise"))
+    spec = LabelSpec(**config["label_spec"])
+    store = LocalBarStore(config["data_dir"], cache_dir=config["cache_dir"],
+        policy=ReadPolicy(negative_order_policy=config.get("negative_order_policy", "reject"), **config.get("read_budget", {})))
+    kwargs = {"label_spec": spec, "trading_grid": grid, "fold": fold, "instrument_map": mapping,
+              "window_length": model_spec.lookback, "fit_window_length": config.get("fit_window_length", model_spec.lookback),
+              "fields": _factory_fields(model_spec), "seed": config.get("seed", 7),
+              "bar_end_is_available": config.get("bar_end_is_available", False),
+              "scale_review": config.get("scale_review", "local-factory:automatic-finite-check; manual-scale-review-skipped")}
+    if config.get("targets_path"):
+        if config.get("labels_path") or config.get("support_path"):
+            raise ContractError("targets_path 与 labels/support_path 只能使用一套")
+        kwargs["targets"] = _read_contract_table(config["targets_path"], "targets")
+    else:
+        kwargs.update(labels=_read_contract_table(config["labels_path"], "labels"),
+                      support=_read_contract_table(config["support_path"], "target support"))
+    return prepare_local_fold(store, expected, **kwargs), mapping
+
+
+def diagnostic_training_factory(*, config: dict, model_spec, fold: TimeFold) -> tuple[PreparedLocalFold, None]:
+    """Explicit diagnostic-only CLI factory; returns no guessed mapping."""
+    if not isinstance(config, dict) or config.get("scope") != "diagnostic":
+        raise ContractError("diagnostic_training_factory 必须在 data 中显式声明 scope=diagnostic")
+    required = ("data_dir", "cache_dir", "days", "instrument_ids")
+    if any(not config.get(name) for name in required):
+        raise ContractError(f"诊断 data_factory 必须提供 {required}")
+    days = _days(config["days"])
+    if days[0] != fold.train_start or days[-1] + pd.Timedelta(days=1) != fold.validation_end:
+        raise ContractError("诊断 days 必须与 CLI fold 的训练首日/验证末日边界一致")
+    store = LocalBarStore(config["data_dir"], cache_dir=config["cache_dir"],
+        policy=ReadPolicy(negative_order_policy=config.get("negative_order_policy", "reject"), **config.get("read_budget", {})))
+    prepared = prepare_diagnostic_fold(store, days=days, instrument_ids=config["instrument_ids"],
+        validation_start=fold.validation_start, endpoint_minutes=config.get("endpoint_minutes", ["10:00", "11:00", "14:00"]),
+        window_length=model_spec.lookback, fit_window_length=config.get("fit_window_length", model_spec.lookback),
+        fields=_factory_fields(model_spec), seed=config.get("seed", 7), bar_end_is_available=config.get("bar_end_is_available", False))
+    prepared.fold = fold
+    prepared.manifest["fold"]["name"] = fold.name
+    return prepared, None

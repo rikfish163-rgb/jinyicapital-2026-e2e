@@ -61,8 +61,8 @@ class ExperimentPlan:
         for name, values in (("lookbacks", self.lookbacks), ("seeds", self.seeds)):
             if not values or len(set(values)) != len(values) or any(type(value) is not int or value < (1 if name == "lookbacks" else 0) for value in values):
                 raise ContractError(f"{name} 必须为无重复的非空合法整数序列")
-        if any(value >= 2**63 for value in self.seeds):
-            raise ContractError("seed 必须小于 2**63")
+        if any(value >= 2**32 for value in self.seeds):
+            raise ContractError("seed 必须小于 2**32，与 TrainingConfig 一致")
         if self.training is not None and not isinstance(self.training, dict):
             raise ContractError("training 配置必须为字典")
         if not isinstance(self.budget, ExperimentBudget):
@@ -158,16 +158,14 @@ class _BudgetPrepared:
 def _default_runner(request: ExperimentRequest, prepared: PreparedLocalFold, output_dir: Path) -> dict:
     # Imports are deferred so preparing and inspecting data does not load the Trainer.
     from .temporal import ModelSpec, create_score_model
-    from .training import Trainer, TrainingConfig
+    from .training import Trainer, TrainingConfig, seed_everything
 
-    torch.manual_seed(request.seed)
-    if torch.device(request.device).type == "cuda":
-        torch.cuda.manual_seed_all(request.seed)
+    training_config = TrainingConfig.from_dict(request.training)
+    seed_everything(request.seed, deterministic=training_config.deterministic)
     spec = ModelSpec.from_dict(request.model_spec)
     model = create_score_model(spec)
     if tuple(model.encoder.fields) != prepared.fields:
         raise ContractError("比较候选编码器字段必须与 prepared.fields 一致")
-    training_config = TrainingConfig.from_dict(request.training)
     trainer = Trainer(model, training_config, output_dir=output_dir, model_spec=spec,
         contracts=request.contracts, instrument_map=prepared.instrument_map, fold=prepared.fold,
         device=request.device, scope="official" if prepared.scope == "official" else "diagnostic")

@@ -45,4 +45,6 @@ benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞�
 
 正式入口模板为 `configs/b_official_template.json`。null 项需要填入真正的官方文件；它们是可操作的缺项而非可训练的假数据。正式标签准备好后，保持相同时间折和目标合同运行矩阵，选择开发验证候选，再由模型包与提交入口冻结交接。
 
+统一 `.py` CLI 也可选择 `data_factory="ptop.local_training:local_training_factory"`，data 中填写上述官方文件路径及私人 cache_dir；正式 factory 的窗口字段取真实 model.encoder.fields。工程诊断可运行 `python -m ptop.train --config configs/b_train_cli_diagnostic.json --output /私人目录/cli-smoke --device cpu --threads 2`。此配置显式选择 `diagnostic_training_factory`，输出可恢复训练 checkpoint，但不导出包含假股票代码的正式模型包。
+
 当前验证记录将由真实运行追加；只有确实执行并检查的结果才写入实验结论。
