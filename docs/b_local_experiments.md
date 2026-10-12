@@ -58,3 +58,20 @@ benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞�
 当前验证记录将由真实运行追加；只有确实执行并检查的结果才写入实验结论。
 
 第一轮实际读取检查已在 pandas 2.2.3 / NumPy 2.2.6 / Arrow 20.0.0 环境执行。202001 月文件被流式拆出所选三日和四个原始 ID，每日 1,000 行、25 字段、24,808 个有效观测；没有股票代码映射，六个委托笔数字段在此范围没有负值。月拆分耗时约 0.58 秒，三日 A 规范化读取约 0.076 秒，进程累计 RSS 峰值约 291 MiB。这是实际 raw 分区与 A 规范化检查，未执行 N1/训练的阶段不能当作训练验证通过。私人记录：`/home/data4/hts/jyc2026/b_work/b_ingest_read_probe/report.json`。
+
+最终执行证据基于集成 core `8d6b25b`，固定 CPU PyTorch 2.8 与上述依赖、2 个计算线程，产物目录为 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-final-v3`。24 格真实窗口矩阵全部完成，失败和预算超限均为 0；每格 2 个完整 epoch、12 次优化更新，共 48 个 epoch、288 次更新。每个 epoch 的 12 个验证键、best/last checkpoint 完整性和日志均已逐文件检查；24 个 best checkpoint 重新加载后的原始验证分数与各自保存结果逐位一致。每格 encoder、backbone、head 三个参数组相对正确 seed 初始化均实际发生更新。
+
+共同 N1 使用 1,520 个唯一训练可见原始行；同一个冻结指纹、有效预测键指纹和训练目标尺度在 24 格间保持一致。所有实际 batch 的可见性来源断言为 bar-end 显式假设，production verification 为 False。上述记录可查 `artifact_audit.json`，不能仅凭 run.json 中的 completed 判定训练成功。
+
+| 主干 | 总参数 | encoder | backbone | head |
+| --- | ---: | ---: | ---: | ---: |
+| B-GRU | 20,161 | 3,264 | 15,808 | 1,089 |
+| B-Transformer | 31,905 | 3,264 | 27,552 | 1,089 |
+| B-TCN | 19,041 | 3,264 | 14,688 | 1,089 |
+| B-SelectiveSSM | 18,465 | 3,264 | 14,112 | 1,089 |
+
+同次 GRU-L120 数据读取和前向 benchmark 共 12 样本，约 0.0847 秒，其中 loader 等待 0.0618 秒、传输 0.00023 秒、前向 0.0225 秒，约 142 样本/秒。整个 24 格进程的累计 RSS 峰值约 584 MiB；这个小范围检查不能证明全股票池或平台 3 小时时限。
+
+真实 `.py` CLI 的 GRU-L120-seed7 恢复对照也已执行：一次完整 2 epoch，与在第 1 epoch 保存后重新启动进程恢复至第 2 epoch，比对 model、optimizer、optimizer layout、scheduler、scaler 和 RNG 六项均逐位一致，模型最大绝对差为 0。这项结论仅覆盖该固定环境和真实小样例；记录位于 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-resume-v3/resume_audit.json`。早期 core 的相同对照曾出现约 6e-8 的末位差，保留旧产物而未将其冒称为当前验证。
+
+这些检查证明分区、联合训练、权重保存、恢复与实验记录可运行。人工目标上的 loss/IC 仍不是金融预测表现；正式候选选择和比赛成绩需要真正的官方键、映射、标签合同与支持区间。
