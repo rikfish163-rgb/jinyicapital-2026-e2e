@@ -128,7 +128,7 @@ def test_decimal_constant_fields_match_actual_a_ignore_with_asymmetric_partition
     assert "bid_price2" in prepared.normalization_diagnostics["constant_field_exact_reduction"]
 
 
-@pytest.mark.parametrize("size", [15, 129, 257, 12345, 100000])
+@pytest.mark.parametrize("size", [15, 129, 257, 8191, 8192, 8193, 12345, 100000])
 def test_bounded_constant_missing_reduction_matches_pinned_numpy_bitwise(tmp_path, size):
     random = np.random.default_rng(7)
     values = np.full(size, 9.46)
@@ -143,6 +143,30 @@ def test_bounded_constant_missing_reduction_matches_pinned_numpy_bitwise(tmp_pat
         std = np.sqrt(_pinned_pairwise_sum(reader, 0, size, squared_center=center) / np.count_nonzero(values))
         assert std == np.nanstd(np.where(values != 0, values, np.nan))
         assert len(reader.buffer) <= 16384
+    finally:
+        reader.close()
+
+
+def test_large_constant_missing_reference_matches_actual_pinned_qlib(tmp_path):
+    from qlib.data.dataset.processor import ZScoreNorm
+
+    values = np.full(12345, 9.46)
+    values[np.random.default_rng(7).random(len(values)) < 0.1] = np.nan
+    index = pd.MultiIndex.from_arrays([pd.DatetimeIndex(["2024-01-02 10:00"] * len(values)), np.arange(len(values))],
+                                     names=["datetime", "instrument"])
+    frame = pd.DataFrame({("feature", "constant"): values, ("feature", "other"): np.arange(len(values))}, index=index)
+    reference = ZScoreNorm(fit_start_time="2024-01-02", fit_end_time="2024-01-02", fields_group="feature")
+    reference.fit(frame)
+    path = tmp_path / "qlib-reference-column.f64"
+    path.write_bytes(np.nan_to_num(values, nan=0.0).tobytes())
+    reader = _ColumnReader(path, len(values))
+    try:
+        count = int(np.isfinite(values).sum())
+        center = float(_pinned_pairwise_sum(reader, 0, len(values)) / count)
+        scale = float(np.sqrt(_pinned_pairwise_sum(reader, 0, len(values), squared_center=center) / count))
+        assert reference.mean_train[0] == (0.0 if scale == 0 else center)
+        assert reference.std_train[0] == (1.0 if scale == 0 else scale)
+        assert bool(reference.ignore[0]) == (scale == 0)
     finally:
         reader.close()
 

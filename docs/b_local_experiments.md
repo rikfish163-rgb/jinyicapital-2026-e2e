@@ -27,6 +27,8 @@ N1 只使用训练端点可见的唯一原始行。每一天先通过 A 的 `fit
 
 对于浮点常量，简单按日汇合的舍入误差可能改变 Qlib 严格 `std==0` 的 ignore。实现额外保留精确常量归约：无缺失时使用虚拟 broadcast view，带缺失时将一列临时写入私人磁盘，采用最多 16,384 个元素的读取缓冲和原生 NumPy 叶归约，临时文件随拟合完成删除。排序与划分依据固定 [NumPy 2.2.6 pairwise reduction](https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/umath/loops_utils.h.src)；实际算术由同版本 NumPy 执行。测试覆盖不对称分区中的货币常量及带缺失常量，不能仅用整数零字段证明等价。
 
+第二轮固定依赖回归发现，仅复现递归 kernel 在超过 NumPy iterator 缓冲长度后仍会改变末位舍入。归约因此也保留实际 `numpy.getbufsize()` 外层分段，并记录该数值；测试检查 8191/8192/8193 等边界，以及实际锁定 Qlib 对 12,345 行缺失常量的 mean/std/ignore。
+
 `ReadPolicy` 默认拒绝未知负值。下载文件中的盘口委托笔数是有符号 int16；显式 `negative_order_policy="mask_known"` 时，仅六个 `*_num_orders{1,2,3}` 的负值会改为缺失并计入读取审计。不会取绝对值、转换 uint16、加 65536 或推测原值。价格、金额和成交量等其他负值继续由 A 拒绝。正数笔数保持真实值，缺失 mask 继续进入 encoder。
 
 可以在固定训练依赖环境执行真实行情工程诊断：

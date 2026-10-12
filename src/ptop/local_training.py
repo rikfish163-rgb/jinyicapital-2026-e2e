@@ -315,7 +315,7 @@ class _ColumnReader:
         self.file.close()
 
 
-def _pinned_pairwise_sum(reader: _ColumnReader, begin: int, size: int, *, squared_center: float | None = None) -> np.float64:
+def _native_pairwise_sum(reader: _ColumnReader, begin: int, size: int, *, squared_center: float | None = None) -> np.float64:
     """Match NumPy 2.2.6 fast-axis reduction using bounded native leaves.
 
     The split boundary comes from NumPy's published pairwise algorithm; each
@@ -330,8 +330,18 @@ def _pinned_pairwise_sum(reader: _ColumnReader, begin: int, size: int, *, square
         return np.sum(values, dtype=np.float64)
     half = size // 2
     half -= half % 8
-    return (_pinned_pairwise_sum(reader, begin, half, squared_center=squared_center) +
-            _pinned_pairwise_sum(reader, begin + half, size - half, squared_center=squared_center))
+    return (_native_pairwise_sum(reader, begin, half, squared_center=squared_center) +
+            _native_pairwise_sum(reader, begin + half, size - half, squared_center=squared_center))
+
+
+def _pinned_pairwise_sum(reader: _ColumnReader, begin: int, size: int, *, squared_center: float | None = None) -> np.float64:
+    # NumPy's reduction iterator calls the native pairwise kernel per buffer;
+    # reproducing only the recursive kernel changes rounding after 8192 rows.
+    result = np.float64(0.0)
+    block_size = np.getbufsize()
+    for offset in range(begin, begin + size, block_size):
+        result += _native_pairwise_sum(reader, offset, min(block_size, begin + size - offset), squared_center=squared_center)
+    return result
 
 
 def _constant_column_statistics(store, train_expected, trading_grid, *, columns, first, count, fit_count,
@@ -458,6 +468,7 @@ def fit_partitioned_n1(store: LocalBarStore, train_expected: pd.DataFrame, tradi
                    "scale_review": scale_review, "scope": scope, "automatic_float32_finite_check": False}
     diagnostics["constant_field_exact_reduction"] = [FEATURES[column] for column in constant_columns]
     diagnostics["constant_reduction_reference"] = "NumPy 2.2.6 fast-axis pairwise sums; bounded 16384-element buffer"
+    diagnostics["constant_reduction_numpy_iterator_buffer_size"] = np.getbufsize()
     # Check A's exact frozen transform on every training partition, without gathering days.
     for day, samples in train_expected.groupby(train_expected.decision_time.dt.normalize(), sort=True):
         raw = store.read_day(day, instrument_map=instrument_map, bar_end_is_available=bar_end_is_available)
