@@ -47,7 +47,7 @@ B 额外记录原始 available_at 的来源。A 规范化按显式 bar-end 假�
 
 产物位于私人 output_dir：`prepared_manifest.json`、`normalization.json`、`split_audit.parquet`、真实读取/前向的 `benchmark.json`，以及 matrix 下的训练日志、checkpoint、完整验证结果、`comparison.csv`、`seed_summary.csv` 和 `report.md`。报告明确区分已完成、失败和预算超限；超限不替换成更简单模型，只有上一完整 epoch 的 checkpoint 保证可恢复。`--resume-completed` 会验证已完成实验的协议和验证文件哈希后跳过。
 
-计划协议同时锁定 A/B 执行源码 SHA256；旧实现的结果不能在修改算法后无声当作当前已完成实验。模型记录实际总参数和 encoder/backbone/head 参数数，不把相同 width/layers 误称为相同容量。TCN 感受野与池化方式应一同阅读；默认 mean pooling 汇总整个有效窗口中的局部卷积结果。
+计划协议同时锁定 A/B 执行源码 SHA256；旧实现的结果不能在修改算法后无声当作当前已完成实验。模型记录实际总参数和真实注册模块的参数数；原生 A 为 encoder/rnn/att_net/fc_out，现代 B 为 encoder/backbone/pool/head，无参数模块保留 0。不把相同 width/layers 误称为相同容量。TCN 感受野与池化方式应一同阅读；默认 mean pooling 汇总整个有效窗口中的局部卷积结果。
 
 benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞吐和内存。CUDA 测量显式同步并重置分配峰值；CPU RSS 是整个进程的累计峰值，不冒称为某一个模型独立占用。没有官方标签时不计算或宣称平台 BARRA、压力场景、换手百分位或五项总分。
 
@@ -59,7 +59,7 @@ benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞�
 
 第一轮实际读取检查已在 pandas 2.2.3 / NumPy 2.2.6 / Arrow 20.0.0 环境执行。202001 月文件被流式拆出所选三日和四个原始 ID，每日 1,000 行、25 字段、24,808 个有效观测；没有股票代码映射，六个委托笔数字段在此范围没有负值。月拆分耗时约 0.58 秒，三日 A 规范化读取约 0.076 秒，进程累计 RSS 峰值约 291 MiB。这是实际 raw 分区与 A 规范化检查，未执行 N1/训练的阶段不能当作训练验证通过。私人记录：`/home/data4/hts/jyc2026/b_work/b_ingest_read_probe/report.json`。
 
-最终执行证据基于集成 core `8d6b25b`，固定 CPU PyTorch 2.8 与上述依赖、2 个计算线程，产物目录为 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-final-v3`。24 格真实窗口矩阵全部完成，失败和预算超限均为 0；每格 2 个完整 epoch、12 次优化更新，共 48 个 epoch、288 次更新。每个 epoch 的 12 个验证键、best/last checkpoint 完整性和日志均已逐文件检查；24 个 best checkpoint 重新加载后的原始验证分数与各自保存结果逐位一致。每格 encoder、backbone、head 三个参数组相对正确 seed 初始化均实际发生更新。
+前一版完整执行证据基于集成 core `8d6b25b`，固定 CPU PyTorch 2.8 与上述依赖、2 个计算线程，产物目录为 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-final-v3`。24 格真实窗口矩阵全部完成，失败和预算超限均为 0；每格 2 个完整 epoch、12 次优化更新，共 48 个 epoch、288 次更新。每个 epoch 的 12 个验证键、best/last checkpoint 完整性和日志均已逐文件检查；24 个 best checkpoint 重新加载后的原始验证分数与各自保存结果逐位一致。每格 encoder、backbone、head 三个参数组相对正确 seed 初始化均实际发生更新。
 
 共同 N1 使用 1,520 个唯一训练可见原始行；同一个冻结指纹、有效预测键指纹和训练目标尺度在 24 格间保持一致。所有实际 batch 的可见性来源断言为 bar-end 显式假设，production verification 为 False。上述记录可查 `artifact_audit.json`，不能仅凭 run.json 中的 completed 判定训练成功。
 
@@ -75,3 +75,24 @@ benchmark 分别记录 loader 等待、张量传输、前向耗时、样本吞�
 真实 `.py` CLI 的 GRU-L120-seed7 恢复对照也已执行：一次完整 2 epoch，与在第 1 epoch 保存后重新启动进程恢复至第 2 epoch，比对 model、optimizer、optimizer layout、scheduler、scaler 和 RNG 六项均逐位一致，模型最大绝对差为 0。这项结论仅覆盖该固定环境和真实小样例；记录位于 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-resume-v3/resume_audit.json`。早期 core 的相同对照曾出现约 6e-8 的末位差，保留旧产物而未将其冒称为当前验证。
 
 这些检查证明分区、联合训练、权重保存、恢复与实验记录可运行。人工目标上的 loss/IC 仍不是金融预测表现；正式候选选择和比赛成绩需要真正的官方键、映射、标签合同与支持区间。
+
+最终 CPU 证据更新到集成 core `4a4d18f`：验证使用与冻结推理入口相同的 FP32 forward，最新现代矩阵保存到 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-final-v4`。24/24 格完成，失败和预算超限仍均为 0，共 48 个完整 epoch、288 次优化更新。`artifact_audit.json` 逐文件检查两轮完整验证、best/last 权重、梯度日志、全部三个训练参数组更新和各 best checkpoint 的 FP32 分数逐位回放。`selection_audit.json` 将完整 best-epoch 验证表与保存比较表核对，再按原 microbatch 与冻结 target_scale 从保存分数重算 loss；24 格最佳选择数值的最大绝对差为 0。
+
+这次 CPU 矩阵的每格训练范围、目标、同键覆盖与 N1 都与前述诊断相同。GRU-L120 的 12 样本 benchmark 约 0.0908 秒，其中 loader 等待 0.0664 秒、张量传输 0.00030 秒、前向 0.0238 秒，约 132 样本/秒。24 格记录的逐实验耗时合计约 44.33 秒；进程累计 RSS 峰值约 578 MiB。这些测量仍只覆盖三日四个原始股票 ID 的小范围工程检查。
+
+同一 core 的真实 CLI 恢复产物在 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-resume-v4`，完整训练对照在 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-uninterrupted-cli-v4`。第一轮保存后重新启动进程恢复至第二轮，与完整两轮相比，model、optimizer、optimizer layout、scheduler、scaler、RNG 六项均逐位一致，最大模型差为 0。`resume_audit.json` 保留实际比较和容差；逐位一致只描述这一个固定环境的 GRU-L120-seed7 检查。
+
+原生 A 的 R0/R1 参照也已实际执行：集成 `6cd71f1` 仅修复实验入口对 backbone/head 模块名的假定，训练、数据和模型实现与 `4a4d18f` 的源码指纹逐项相同。默认 runner 在 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-a-baselines-final` 完成 R0/R1 × L60/120 × seeds7/17/29 共 12 格，各两轮、独立 600 秒预算；失败和预算超限均为 0，共 24 个完整 epoch、144 次更新。复制的私人配置仅改变 model_specs，其余训练设置和数据配置保持一致。
+
+| A 参照 | 总参数 | encoder | rnn | att_net | fc_out |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| R0 | 47,297 | 0 | 47,232 | — | 65 |
+| R1 | 55,425 | 3,264 | 49,920 | 2,112 | 129 |
+
+A 的 raw encoder 无训练参数，不能声称 R0 encoder 权重发生更新。12 格所有实际可训练模块均更新，包括 R1 的 encoder、rnn、att_net、fc_out；全部最佳权重 FP32 分数回放逐位一致，保存分数重算的最佳 loss 最大绝对差也是 0。A/B 同时核验了采样键、训练/验证目标指纹、目标尺度、冻结 N1、字段、时间 fold、训练预算和数据/模型/Trainer 源码。调度器的参数统计源码指纹按各自运行版本保留，没有将旧矩阵伪装成新源码完成结果。
+
+A 参照使用原生 hidden_size=64：R0 为 raw encoder 加 GRU 末端池化，R1 为 ALSTM encoder 加 GRU attention。现代 B 使用 width=32、ALSTM encoder 和 mean pooling；两组容量和池化不同，因此这是原生参照与现代候选的工程对比，不能视作只改变主干的等容量消融。全部 36 格共享 1,520 个唯一训练可见行的同一 N1、12 个验证键和 `0.005828910631702901` 的训练目标尺度；batch 可见性来源仍明确是未获生产验证的 bar-end 假设。
+
+私人合并记录位于 `/home/data4/hts/jyc2026/b_runs/diagnostic-cpu-a-b-engineering-comparison-final`：`comparison.csv` 保存 36 格模块参数、实际训练/验证耗时、loader 等待和权重审计来源；`summary.csv` 按模型/窗口汇总三 seed 工程耗时；`manifest.json` 锁定两套来源和审计文件哈希；`report.md` 说明容量及范围。共 72 个完整 epoch、432 次优化更新。该工程报告不按人工 loss/IC 给金融能力排名，正式金融预测表现和比赛分数仍需官方输入合同。
+
+入口兼容性回归在固定 CPU 环境实际通过 25 项本地测试，其中原生 R0、R1 与现代 B-GRU 都走默认 runner 完成完整 epoch、训练参数更新、完整采样键和保存分数回放检查。源码修复只涉及实验分组统计及可选 TCN 感受野，未改变训练或模型算法。
