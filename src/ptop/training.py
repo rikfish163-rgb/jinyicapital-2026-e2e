@@ -309,7 +309,7 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config.epochs, eta_min=config.min_learning_rate,
         )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=config.precision == "fp16")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=config.precision == "fp16", init_scale=config.amp_initial_scale)
         self.global_step = 0
         self._processor_fingerprint = None
 
@@ -362,6 +362,8 @@ class Trainer:
     def _phase(self, loader, table: pd.DataFrame, *, training: bool, epoch: int):
         self.model.train(training)
         count = steps = batches = skipped = 0
+        amp_skipped = 0
+        initial_step = self.global_step
         loss_sum = data_wait = 0.0
         frames, skip_counts = [], {}
         seen = set()
@@ -417,25 +419,38 @@ class Trainer:
                         raise ContractError("objective detached the joint-training graph")
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
-                    for name, parameter in self.model.named_parameters():
-                        if parameter.requires_grad and (parameter.grad is None or not torch.isfinite(parameter.grad).all()):
-                            raise ContractError(f"joint-training gradient missing/nonfinite: {name}")
-                    gradient_norm = float(torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.clip_norm, error_if_nonfinite=True,
-                    ).detach().cpu())
+                    trainable = [(name, parameter) for name, parameter in self.model.named_parameters() if parameter.requires_grad]
+                    missing = [name for name, parameter in trainable if parameter.grad is None]
+                    if missing:
+                        raise ContractError(f"joint-training gradients missing: {missing}")
+                    gradients_finite = all(torch.isfinite(parameter.grad).all() for _, parameter in trainable)
+                    if not gradients_finite and not self.scaler.is_enabled():
+                        raise ContractError("joint-training gradients nonfinite without FP16 dynamic scaling")
+                    if gradients_finite:
+                        gradient_norm = float(torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.clip_norm, error_if_nonfinite=True,
+                        ).detach().cpu())
+                    else:
+                        amp_skipped += 1
+                    # unscale_ recorded found_inf: GradScaler skips this optimizer update
+                    # and lowers its scale. Never clip or apply nonfinite gradients.
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    self.global_step += 1
+                    if gradients_finite:
+                        self.global_step += 1
+                    if self.scaler.is_enabled() and self.scaler.get_scale() < 1:
+                        raise ContractError("FP16 scale fell below one; inspect input/loss magnitude or use bf16/fp32")
                 numeric_loss = float(loss.detach().float().cpu())
                 frame.loc[chosen, "score"] = scores.detach().float().cpu().numpy()
                 supervised_count = int(flags.sum().item())
                 loss_sum += numeric_loss * supervised_count
                 count += supervised_count
                 steps += 1
-                if training and (self.global_step == 1 or self.global_step % self.config.log_every == 0):
+                if training and (not gradients_finite or self.global_step == 1 or self.global_step % self.config.log_every == 0):
                     self._log({"event": "step", "epoch": epoch + 1, "global_step": self.global_step,
                                "loss": numeric_loss, "count": len(chosen), "gradient_norm": gradient_norm,
                                "learning_rate": self.optimizer.param_groups[0]["lr"], "diagnostics": diagnostics,
+                               "optimizer_step_skipped": not gradients_finite, "amp_scale": self.scaler.get_scale(),
                                "data_wait_seconds": data_wait, "elapsed_seconds": time.perf_counter() - started})
             if not training:
                 frames.append(frame)
@@ -444,12 +459,15 @@ class Trainer:
             torch.cuda.synchronize(self.device)
         if not count:
             raise ContractError("phase has no valid supervised samples; no checkpoint will be selected")
+        if training and self.global_step == initial_step:
+            raise ContractError("all optimizer updates skipped; lower amp_initial_scale or use bf16/fp32")
         if seen != set(table.index):
             missing = len(set(table.index) - seen)
             raise ContractError(f"phase loader did not process its complete declared sample set ({missing} missing)")
         seconds = time.perf_counter() - started
         stats = {"loss": loss_sum / count, "count": count, "skipped": skipped,
                  "skip_reasons": skip_counts, "batches": batches, "microbatches": steps,
+                 "optimizer_steps": self.global_step - initial_step, "amp_skipped_steps": amp_skipped,
                  "seconds": seconds, "data_wait_seconds": data_wait, "samples_per_second": count / seconds,
                  "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                  "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0,
@@ -545,6 +563,7 @@ class Trainer:
             "objective": objective_config, "device": str(self.device), "scope": self.scope,
             "score_units": ("training-target-scale normalized score" if isinstance(self.objective, RegressionObjective)
                             else objective_config.get("score_units", "custom objective; units declared by C")),
+            "cuda_epoch_seed": "(seed + epoch_index) modulo 2**32; resets cuDNN RNN dropout state",
             "platform_evaluation_verified": False,
         })
         stop_reason = "epochs_completed"
@@ -553,6 +572,11 @@ class Trainer:
             limit, stop_reason = start_epoch, "early_stopping"
         for epoch in range(start_epoch, limit):
             epoch_start = time.perf_counter()
+            if self.device.type == "cuda":
+                # cuDNN caches an RNN dropout buffer outside model.state_dict and
+                # the public CUDA RNG state. At an epoch boundary reseeding also
+                # resets this buffer; full and resumed epochs then share a stream.
+                torch.cuda.manual_seed_all((self.config.seed + epoch) % 2**32)
             train_stats, _ = self._phase(self._loader(prepared, "train", epoch), indexed_train, training=True, epoch=epoch)
             validation_stats, predictions = self._phase(
                 self._loader(prepared, "validation", epoch), indexed_validation, training=False, epoch=epoch,

@@ -37,18 +37,40 @@ def test_complete_cuda_amp_train_checkpoint_and_export(name, precision, prepared
         assert torch.isfinite(restored(*inputs)).all()
 
 
-def test_cuda_dropout_resume_restores_optimizer_scaler_and_rng(prepared_fold, tmp_path):
+@pytest.mark.parametrize("layers", (1, 2))
+def test_cuda_dropout_resume_restores_optimizer_scaler_and_rng(layers, prepared_fold, tmp_path):
     assert torch.cuda.is_available()
     prepared, mapping, fold = prepared_fold
     config = TrainingConfig(epochs=3, patience=5, selection_metric="loss", mode="min", seed=19,
                             microbatch_size=2, precision="fp16")
-    full = make_trainer(tmp_path / "full", mapping, fold, config=config, device="cuda:0")
+    spec = ModelSpec(name="B-GRU", lookback=4, width=8, layers=layers, head_width=8, dropout=0.1)
+    full = make_trainer(tmp_path / "full", mapping, fold, config=config, model_spec=spec, device="cuda:0")
     full.fit(prepared)
-    partial = make_trainer(tmp_path / "restart", mapping, fold, config=config, device="cuda:0")
+    partial = make_trainer(tmp_path / "restart", mapping, fold, config=config, model_spec=spec, device="cuda:0")
     stopped = partial.fit(prepared, stop_after_epochs=1)
-    restarted = make_trainer(tmp_path / "restart", mapping, fold, config=config, device="cuda:0")
+    restarted = make_trainer(tmp_path / "restart", mapping, fold, config=config, model_spec=spec, device="cuda:0")
     restarted.fit(prepared, resume=stopped.last_checkpoint)
     assert_nested_equal(full.model.state_dict(), restarted.model.state_dict())
     assert_nested_equal(full.optimizer.state_dict(), restarted.optimizer.state_dict())
     assert_nested_equal(full.scheduler.state_dict(), restarted.scheduler.state_dict())
     assert_nested_equal(full.scaler.state_dict(), restarted.scaler.state_dict())
+
+
+def test_fp16_overflow_skips_update_lowers_scale_and_remains_trainable(prepared_fold, tmp_path):
+    prepared, mapping, fold = prepared_fold
+    config = TrainingConfig(epochs=1, patience=2, selection_metric="loss", mode="min", seed=19,
+                            microbatch_size=2, precision="fp16")
+    trainer = make_trainer(tmp_path / "overflow", mapping, fold, config=config, device="cuda:0")
+    attempts = []
+    def overflow_once(gradient):
+        attempts.append(True)
+        return torch.full_like(gradient, float("inf")) if len(attempts) == 1 else gradient
+    handle = next(trainer.model.encoder.parameters()).register_hook(overflow_once)
+    try:
+        result = trainer.fit(prepared)
+    finally:
+        handle.remove()
+    stats = result.history[0]["train"]
+    assert stats["amp_skipped_steps"] == 1
+    assert stats["optimizer_steps"] == stats["microbatches"] - 1 == trainer.global_step
+    assert trainer.scaler.get_scale() == config.amp_initial_scale / 2

@@ -25,6 +25,7 @@ class TrainingConfig:
     rank_weight: float = 0.0
     huber_delta: float = 1.0
     log_every: int = 10
+    amp_initial_scale: float = 1024.0
 
     def __post_init__(self):
         for name in ("epochs", "patience", "microbatch_size", "log_every"):
@@ -33,12 +34,12 @@ class TrainingConfig:
                 raise ContractError(f"{name} must be a positive integer")
         if type(self.seed) is not int or not 0 <= self.seed < 2**32:
             raise ContractError("seed must be an integer in [0, 2**32)")
-        for name in ("learning_rate", "min_learning_rate", "weight_decay", "clip_norm", "min_delta", "rank_weight", "huber_delta"):
+        for name in ("learning_rate", "min_learning_rate", "weight_decay", "clip_norm", "min_delta", "rank_weight", "huber_delta", "amp_initial_scale"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ContractError(f"{name} must be finite and nonnegative")
-        if self.learning_rate <= 0 or self.clip_norm <= 0 or self.huber_delta <= 0:
-            raise ContractError("learning_rate, clip_norm and huber_delta must be positive")
+        if self.learning_rate <= 0 or self.clip_norm <= 0 or self.huber_delta <= 0 or self.amp_initial_scale < 1:
+            raise ContractError("learning_rate, clip_norm and huber_delta must be positive; AMP initial scale >= 1")
         if self.min_learning_rate > self.learning_rate:
             raise ContractError("min_learning_rate exceeds learning_rate")
         if self.target_scale is not None and (
