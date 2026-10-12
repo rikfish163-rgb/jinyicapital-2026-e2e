@@ -362,6 +362,17 @@ class Trainer:
             raise ContractError("objective diagnostics must be a dictionary")
         return loss, diagnostics
 
+    def _selected_checkpoint(self, processor, split, best_epoch, best_metric):
+        from .checkpoint import load_inference_checkpoint
+        selected, selected_processor, metadata = load_inference_checkpoint(
+            self.best_checkpoint, device="cpu", expected_contracts=self.contracts,
+        )
+        if (metadata["config"] != self.config.to_dict() or metadata["model_spec"] != self.model_spec.to_dict()
+                or metadata["split"] != split or metadata["epoch"] != best_epoch
+                or metadata["best_metric"] != best_metric or selected_processor.fingerprint != processor.fingerprint):
+            raise ContractError("best.pt does not belong to this run's selected epoch/config/data contract")
+        return selected, selected_processor
+
     def _phase(self, loader, table: pd.DataFrame, *, training: bool, epoch: int):
         self.model.train(training)
         count = steps = batches = skipped = 0
@@ -441,8 +452,8 @@ class Trainer:
                     self.scaler.update()
                     if gradients_finite:
                         self.global_step += 1
-                    if self.scaler.is_enabled() and self.scaler.get_scale() < 1:
-                        raise ContractError("FP16 scale fell below one; inspect input/loss magnitude or use bf16/fp32")
+                    if self.scaler.is_enabled() and (not math.isfinite(self.scaler.get_scale()) or self.scaler.get_scale() <= 0):
+                        raise ContractError("FP16 scale is zero/nonfinite; inspect input/loss magnitude or use bf16/fp32")
                 numeric_loss = float(loss.detach().float().cpu())
                 frame.loc[chosen, "score"] = scores.detach().float().cpu().numpy()
                 supervised_count = int(flags.sum().item())
@@ -535,7 +546,9 @@ class Trainer:
                  "train_targets_fingerprint": train_fingerprint, "validation_targets_fingerprint": validation_fingerprint,
                  "scope": self.scope, "objective": objective_config,
                  "evaluator": _callable_contract(self.evaluator), "target_scale": self.target_scale,
-                 "implementation": _implementation_contract(), "inputs": _input_contract(prepared)}
+                 "implementation": _implementation_contract(), "inputs": _input_contract(prepared),
+                 "instrument_map": ([[int(key), value] for key, value in sorted(self.instrument_map.items())]
+                                    if self.instrument_map is not None else None)}
         indexed_train, indexed_validation = train.set_index("sample_id", drop=False), validation.set_index("sample_id", drop=False)
         start_epoch = completed = bad_epochs = 0
         best_metric, best_epoch = None, 0
@@ -558,6 +571,8 @@ class Trainer:
                 raise ContractError("checkpoint exceeds configured scheduler horizon")
             if best_epoch and not self.best_checkpoint.exists():
                 raise ContractError("resume requires the matching run's best.pt; do not copy last.pt alone")
+            if best_epoch:
+                self._selected_checkpoint(processor, split, best_epoch, best_metric)
         elif self.best_checkpoint.exists() or self.last_checkpoint.exists() or (self.output_dir / "history.json").exists():
             raise ContractError("output run already exists; use a new directory or explicit resume")
         write_json(self.output_dir / "run_config.json", {
@@ -627,8 +642,7 @@ class Trainer:
         bundle_path = None
         if self.scope == "official":
             # Export the selected weights without replacing last-epoch model or optimizer state.
-            from .checkpoint import load_inference_checkpoint
-            selected_model, selected_processor, metadata = load_inference_checkpoint(self.best_checkpoint, device="cpu")
+            selected_model, selected_processor = self._selected_checkpoint(processor, split, best_epoch, best_metric)
             bundle_path = self.output_dir / "bundles" / f"epoch{best_epoch:04d}"
             bundle_path.parent.mkdir(exist_ok=True)
             if bundle_path.exists():

@@ -126,7 +126,10 @@ def main(argv=None) -> dict:
     if args.mode == "single":
         plan = replace(plan, model_specs=plan.model_specs[:1], lookbacks=plan.lookbacks[:1], seeds=plan.seeds[:1])
     from ptop.temporal import ModelSpec, create_score_model
-    torch.manual_seed(plan.seeds[0])
+    from ptop.training import seed_everything
+    # Set CUBLAS_WORKSPACE_CONFIG before the first CUDA benchmark initializes
+    # cuBLAS; setting it only later in the runner cannot repair an existing handle.
+    seed_everything(plan.seeds[0], deterministic=(plan.training or {}).get("deterministic", True))
     spec = ModelSpec.from_dict({**plan.model_specs[0], "lookback": prepared.window_length})
     benchmark = benchmark_windows(prepared.validation_loader(), model=create_score_model(spec), device=plan.device)
     benchmark.update(scope=prepared.scope, preprocessor_fingerprint=prepared.processor.fingerprint)

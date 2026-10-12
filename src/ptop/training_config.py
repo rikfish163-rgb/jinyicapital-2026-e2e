@@ -38,8 +38,8 @@ class TrainingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ContractError(f"{name} must be finite and nonnegative")
-        if self.learning_rate <= 0 or self.clip_norm <= 0 or self.huber_delta <= 0 or self.amp_initial_scale < 1:
-            raise ContractError("learning_rate, clip_norm and huber_delta must be positive; AMP initial scale >= 1")
+        if self.learning_rate <= 0 or self.clip_norm <= 0 or self.huber_delta <= 0 or self.amp_initial_scale <= 0:
+            raise ContractError("learning_rate, clip_norm, huber_delta and AMP initial scale must be positive")
         if self.min_learning_rate > self.learning_rate:
             raise ContractError("min_learning_rate exceeds learning_rate")
         if self.target_scale is not None and (

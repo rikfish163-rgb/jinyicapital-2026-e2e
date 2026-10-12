@@ -134,6 +134,19 @@ def test_shuffled_label_table_joins_by_sample_key(prepared_fold, tmp_path):
     assert_nested_equal(original.model.state_dict(), shuffled.model.state_dict())
 
 
+def test_resume_rejects_a_best_checkpoint_from_another_run(prepared_fold, tmp_path):
+    import shutil
+    prepared, mapping, fold = prepared_fold
+    first = make_trainer(tmp_path / "first", mapping, fold)
+    saved = first.fit(prepared, stop_after_epochs=1)
+    second_config = replace(first.config, seed=23)
+    second = make_trainer(tmp_path / "second", mapping, fold, config=second_config)
+    other = second.fit(prepared, stop_after_epochs=1)
+    shutil.copyfile(other.best_checkpoint, saved.best_checkpoint)
+    with pytest.raises(ContractError, match="best.pt does not belong"):
+        make_trainer(tmp_path / "first", mapping, fold).fit(prepared, resume=saved.last_checkpoint)
+
+
 def constant_evaluator(predictions):
     assert len(predictions) == 10  # metrics see complete cross sections after all microbatches.
     return {"constant": 1.0}

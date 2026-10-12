@@ -56,10 +56,11 @@ def test_cuda_dropout_resume_restores_optimizer_scaler_and_rng(layers, prepared_
     assert_nested_equal(full.scaler.state_dict(), restarted.scaler.state_dict())
 
 
-def test_fp16_overflow_skips_update_lowers_scale_and_remains_trainable(prepared_fold, tmp_path):
+@pytest.mark.parametrize("initial_scale", (1024.0, 1.0))
+def test_fp16_overflow_skips_update_lowers_scale_and_remains_trainable(initial_scale, prepared_fold, tmp_path):
     prepared, mapping, fold = prepared_fold
     config = TrainingConfig(epochs=1, patience=2, selection_metric="loss", mode="min", seed=19,
-                            microbatch_size=2, precision="fp16")
+                            microbatch_size=2, precision="fp16", amp_initial_scale=initial_scale)
     trainer = make_trainer(tmp_path / "overflow", mapping, fold, config=config, device="cuda:0")
     attempts = []
     def overflow_once(gradient):
