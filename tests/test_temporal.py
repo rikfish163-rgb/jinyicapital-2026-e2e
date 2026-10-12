@@ -354,6 +354,18 @@ def test_cpu_bfloat16_autocast_preserves_joint_training(name):
     assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in model.parameters())
 
 
+@pytest.mark.parametrize("name", MODERN_MODEL_NAMES)
+def test_cpu_bfloat16_validation_under_inference_mode_is_finite(name):
+    model = create_score_model(modern_spec(name)).eval()
+    batch = inputs()
+    with torch.inference_mode():
+        reference = model(*batch)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = model(*batch)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), reference, rtol=0.05, atol=0.01)
+
+
 @pytest.mark.skipif(os.environ.get("PTOP_TEST_CUDA") != "1", reason="CUDA requires explicit isolated-device opt-in")
 @pytest.mark.parametrize("name", MODERN_MODEL_NAMES)
 def test_isolated_cuda_inference_matches_cpu_and_joint_gradients_are_finite(name):

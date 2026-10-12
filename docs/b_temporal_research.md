@@ -66,4 +66,98 @@ CSDI 通过条件扩散学习缺失值分布，TimeGrad 用扩散生成概率时
 
 第一轮实现落地四个主干及九种 A 编码器组合。代码审查确认 Transformer 层逐层独立初始化、用压紧后的每样本真实槽位置计算位置编码、TCN 每层输出有结构 mask；这些决策对应 batch 重排、左填充不变性和跨长度比较的验收目标。第二轮静态审查将容量测试从仅有 Patch5 扩展到 Raw/2049 槽，避免用约 410 个 patch token 的测试间接声称已经覆盖了超出 1024 token 的位置容量。第三轮接口审查发现 last/mean 池化及 causal True/False 并不改变 state_dict 形状，因此给完整模型、池化、Transformer 加入显示实际配置的 `extra_repr`，并通知 bundle 分支显式校验 `model.spec`，避免错误配置保存后改变预测。所有主干都显式保留真实缺分钟，SSM 状态为 forward 局部张量。
 
-测试位于 `tests/test_temporal.py`，覆盖完整 A 九模型同种子逐 tensor 重建、配置往返和非法组合、encoder/backbone/head 梯度和参数更新、全部 A 编码器的可训练性、全部编码器与四主干 eval microbatch/股票重排、左填充、缺分钟、字段子集全空分流、last/mean/attention、2049 窗口、反复推理的参数/buffer/RNG 不变以及 Raw 组合的 token 因果性。CPU/CUDA 实际运行结果与合成拟合迭代记录在完成运行后追加；本节列出验收范围，不把编译检查当作这些行为已经通过。
+测试位于 `tests/test_temporal.py`，覆盖完整 A 九模型同种子逐 tensor 重建、配置往返和非法组合、encoder/backbone/head 梯度和参数更新、全部 A 编码器的可训练性、全部编码器与四主干 eval microbatch/股票重排、左填充、缺分钟、字段子集全空分流、last/mean/attention、2049 窗口、反复推理的参数/buffer/RNG 不变以及 Raw 组合的 token 因果性。另有 SSM 常量输入的闭式零阶保持解、CPU BF16 训练和 eval/inference_mode 验证、同形权重的配置可见性检查。
+
+本次固定 CPU 环境为 Python 3.12.3、Torch 2.8.0+cpu、Qlib 包版本 0.9.8、NumPy 2.2.6、pandas 2.2.3、Arrow 20.0.0、pytest 8.4.2。运行结果为 **148 passed，4 skipped，7.45 秒**：
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  /home/data4/hts/jyc2026_cpu_validation_env/bin/python -m pytest tests/test_temporal.py -q
+```
+
+四个 skip 均为未指定 GPU 时的隔离 CUDA 检查。只有显式设置 `PTOP_TEST_CUDA=1` 且分配 `CUDA_VISIBLE_DEVICES` 才执行；GPU/AMP/续训由总集成分支统一验证，本分支不将 CPU 结果描述为 CUDA 结果。此前对 PyTorch CPU autocast 与融合 eval 路径的审查疑问没有在固定 2.8 环境复现：四个主干 BF16 训练和验证均通过，未因此修改 Transformer 的公开层路径或全局 MHA 开关。
+
+## 合成拟合迭代：池化会改变端点信息保留
+
+四个主干各运行 mean/last 两种池化和 seed 7/19/41，共 24 次实验。共享 512 个训练样本、128 个独立合成验证样本、16 槽序列、原始 25 字段和 mask；长度在 8 至 16 之间，倒数第六槽是真实但全缺行情的分钟。人工 teacher 为 `0.5*最后一槽 close + 0.25*倒数第二槽 volume + 0.15*倒数第四槽 ask_volume1`。这只是过去输入映射的容量诊断，不是比赛未来 VWAP 标签，也没有提供金融预测效果证据。
+
+配置统一为 A ALSTMEncoder、width=32、layers=2、head_width=32、dropout=0、heads=4、kernel=3、state_dim=16，AdamW 学习率 0.003、weight_decay=1e-4、MSE、梯度裁剪 1.0、batch=32、80 步。每十步计算合成验证 MSE，报告其中最小值；表中为三个种子的均值 ± 样本标准差。
+
+| 模型 | mean 池化最佳合成验证 MSE | last 池化最佳合成验证 MSE | 实测参数数 |
+| --- | ---: | ---: | ---: |
+| B-GRU | 0.31654 ± 0.00117 | 0.05444 ± 0.00926 | 20,161 |
+| B-Transformer | 0.31297 ± 0.00255 | 0.10614 ± 0.00654 | 31,905 |
+| B-TCN | 0.26921 ± 0.00744 | 0.02848 ± 0.00531 | 19,041 |
+| B-SelectiveSSM | 0.29847 ± 0.00981 | 0.05458 ± 0.00459 | 18,465 |
+
+last 池化的每次运行都相对初始合成验证误差降低至少 67%；mean 在这个端点 teacher 上弱得多。这个结果支持把池化作为真实验证中的对照变量，并保留可配置的 last/mean/attention；它不支持按这张表选择比赛最优主干。模型默认 last，真实源诊断若使用 mean，需另外复查端点信息是否被稀释。全部模型的 A 编码器有 3,264 个参数，预测头有 1,089 个参数；四个主干分别为 15,808、27,552、14,688、14,112，所以同 width/layers 并不等于同参数容量。
+
+以下代码在项目根目录、同一固定环境与 `PYTHONPATH=src` 下复现 24 次合成拟合；benchmark 的原始记录另保存在本机 `work/temporal-study.json`。
+
+```python
+import torch
+from ptop.schema import FEATURES
+from ptop.temporal import MODERN_MODEL_NAMES, ModelSpec, create_score_model
+
+torch.set_num_threads(2)
+
+def data(count, seed):
+    generator = torch.Generator().manual_seed(seed)
+    lengths = torch.randint(8, 17, (count,), generator=generator)
+    valid = torch.arange(16)[None, :] >= 16 - lengths[:, None]
+    observed = (torch.rand((count, 16, 25), generator=generator) > 0.2) & valid[..., None]
+    for offset, field in ((1, "close"), (2, "volume"), (4, "ask_volume1")):
+        observed[:, -offset, FEATURES.index(field)] = True
+    observed[:, -6, :] = False
+    x = torch.randn((count, 16, 25), generator=generator).masked_fill(~observed, 0)
+    y = (0.5*x[:, -1, FEATURES.index("close")] + 0.25*x[:, -2, FEATURES.index("volume")]
+         + 0.15*x[:, -4, FEATURES.index("ask_volume1")])
+    return (x, observed, valid), y
+
+train, target = data(512, 201)
+validation, truth = data(128, 202)
+for name in MODERN_MODEL_NAMES:
+    for pooling in ("mean", "last"):
+        for seed in (7, 19, 41):
+            torch.manual_seed(seed)
+            model = create_score_model(ModelSpec(
+                name=name, encoder="ALSTM", width=32, layers=2,
+                head_width=32, pooling=pooling, lookback=240,
+            ))  # 实际训练长度16；240为本容量实验的允许上限。
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-4)
+            model.eval()
+            with torch.inference_mode():
+                initial = float(torch.nn.functional.mse_loss(model(*validation), truth))
+            best = initial
+            generator = torch.Generator().manual_seed(500 + seed)
+            order = torch.randperm(512, generator=generator)
+            for step in range(80):
+                if step % 16 == 0:
+                    order = torch.randperm(512, generator=generator)
+                chosen = order[(step % 16)*32:((step % 16)+1)*32]
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                loss = torch.nn.functional.mse_loss(model(*(value[chosen] for value in train)), target[chosen])
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+                optimizer.step()
+                if (step+1) % 10 == 0:
+                    model.eval()
+                    with torch.inference_mode():
+                        best = min(best, float(torch.nn.functional.mse_loss(model(*validation), truth)))
+            print(name, pooling, seed, initial, best)
+```
+
+## CPU token 成本
+
+同一配置在 CPU 两线程、batch=32、全部为真实时间槽、120 槽输入、eval/inference_mode 下，三次预热后计时十二次：GRU 中位 13.72 ms、Transformer 31.03 ms、TCN 7.09 ms、SelectiveSSM 42.10 ms。SSM 虽然参数更少、scan 的序列复杂度线性，在这个长度和实现上依然最慢，不能用官方融合 Mamba 的速度结论替代本实现测量。
+
+另一个独立 token 对照使用同样的 Transformer 宽度、层数和头，比较 A ALSTMEncoder 与 A Patch5；三次预热后十二次 forward 的中位如下：
+
+| 原始槽数 | ALSTM token数 | ALSTM 时间 | Patch5 token数 | Patch5 时间 |
+| ---: | ---: | ---: | ---: | ---: |
+| 60 | 60 | 8.82 ms | 12 | 3.52 ms |
+| 120 | 120 | 38.15 ms | 24 | 5.38 ms |
+| 240 | 240 | 121.73 ms | 48 | 10.08 ms |
+
+Patch5 组合有 45,025 个参数，较 ALSTM 组合多 13,120 个，不能把两个编码器的学习容量混为一谈。这些数值只计本机 tensor 前向，未含查询、预处理、窗口、股票映射或输出检验；并行任务和系统负载也会改变耗时。它们支持研究 token 压缩和主干成本，不构成指定评测环境或三小时总时限的通过证明。
