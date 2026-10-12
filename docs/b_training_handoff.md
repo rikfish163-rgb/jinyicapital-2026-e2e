@@ -1,10 +1,12 @@
 # B 成员：训练、实验与 A/C 交接
 
-本实现以 A 最新 `ptop.raw25.v1` 为准。B 提供完整训练入口、模型配置、按时间验证、最佳权重、恢复训练和推理模型包；A 负责官方数据与可见性合同，C 负责标签定义、官方评分与唯一提交 Notebook。职责依据仓库 `04_团队分工与开发日程.docx`；训练限制依据 `01_比赛规则与参赛流程.docx` 与 `03_模型架构与训练方案.docx`。
+本实现以 A 的上游提交 `a7dd1f790d20b8d4089bbcc3599166fb9f405d7c` 和 `ptop.raw25.v1` 为准。B 提供完整训练入口、模型配置、按时间验证、最佳权重、恢复训练和推理模型包；A 负责官方数据与可见性合同，C 负责标签定义、官方评分与唯一提交 Notebook。职责依据仓库 `04_团队分工与开发日程.docx`；训练限制依据 `01_比赛规则与参赛流程.docx` 与 `03_模型架构与训练方案.docx`。
 
 ## 下载数据与正式训练的边界
 
 四个本地包在 `/home/data4/hts/cpt_jyc_2026_e2e_bar{1m,5m,15m,30m}.tar.gz`，解压目录在 `/home/data4/hts/jyc2026/e2e_data/`。每个频率有 60 个月度 Feather 文件，覆盖 2020–2024 年。总计约 3.93 亿行，不能一次加载成五年 pandas 长表。月度 IPC 读取、日分区缓存和流式训练见 `b_local_experiments.md`。
+
+这些包已经下载并完成完整性检查。`bmeta.bin` 是未获得格式说明的二进制元数据；未把它执行成 Python 对象，也未据其猜测股票代码。这里的缺项指正式训练合同，不表示原始行情尚未下载。
 
 | 项目 | 下载包实际提供 | B 的处理与衔接 |
 | --- | --- | --- |
@@ -52,9 +54,15 @@ stock microbatch 控制显存，每个 microbatch 做一次优化更新；开启
 
 全空输入与无效标签不进训练损失，但留在原始分母和排除统计。验证会给所有输入可预测股票打分，不依标签是否有效过滤推理样本。验证不更新模型权重、标准化、优化器或学习率；学习率仅在完成训练与验证后推进。
 
+FP16/BF16 只用于训练前向；验证、最佳 checkpoint 选择和默认冻结推理统一为 FP32。FP16 使用动态 loss scaling，遇到梯度溢出会跳过该次更新并降低 scale，记录实际更新数和跳过数；不会裁剪或应用非有限梯度。若整轮都没有成功更新则拒绝选权重。BF16 和 FP32 非有限梯度直接报错。
+
 保存 `last.pt` 供恢复，`best.pt` 对应验证指标最优的较早 epoch，平分保留首次最佳。checkpoint 含整个模型、优化器、scheduler、AMP scaler、Python/NumPy/Torch RNG、epoch/step/patience、配置、数据/标签合同和冻结处理器。恢复严格核对这些合同；`--stop-after-epochs` 只限本次调用，不改变原定 scheduler horizon。当前保证 epoch 边界恢复，不声称任意 batch 崩溃续接。
 
+CUDA 每轮按 `(seed + epoch_index) modulo 2**32` 重新设种子，以重置 cuDNN 的 RNN dropout 缓存；该缓存不属于普通 model.state_dict 或公开 CUDA RNG state。恢复时同时核对 best.pt 的配置、数据、最佳 epoch 和指标，防止复制其他运行的最佳权重。相同环境与样例中的精确恢复证据见 `b_verification.md`，不推广为跨硬件逐位一致保证。[PyTorch 2.8 cuDNN 实现](https://github.com/pytorch/pytorch/blob/v2.8.0/aten/src/ATen/native/cudnn/RNN.cpp)
+
 训练和推理使用一致依赖。先准备与目标 GPU 匹配的 Torch 2.8.0，再安装 `requirements-b.txt`。正式运行前安装依赖，模型包内保存精确版本与离线代码。
+
+依赖核对包含 Torch 的实际 build 标识：`2.8.0+cpu` 与 `2.8.0` CUDA build 不会被当成同一环境。若 C 使用 CUDA build，B 也应在该 build 下训练和导出；必要时该环境可选择 device=cpu，不能换 build 后绕过检查。源码、权重和依赖须在评测前部署，运行时不访问外网。
 
 ```bash
 PYTHONPATH=src:. python -m ptop.train \
@@ -75,7 +83,7 @@ PYTHONPATH=src:. python -m ptop.train \
 | training.jsonl / history.json | step/epoch 损失、完整截面研究 RankIC、排除数量、吞吐、数据等待、RSS/CUDA 显存 |
 | validation/epoch-XXXX.parquet | sample/decision/stock/time、score、标签有效性与排除原因，供 C 独立复算 |
 | best.pt / last.pt | 最佳推理权重和恢复训练状态，二者用途分开 |
-| bundles/epochXXXX/ | 正式 scope 的最佳整模型、冻结预处理、映射、配置、代码、依赖与文件校验和 |
+| bundles/epochXXXX/ | 正式 scope 的最佳整模型、冻结预处理、映射、完整训练/架构配置、FP32 推理精度、代码、依赖与文件校验和 |
 | result.json | 最佳 epoch/指标、完成轮数、停止原因和产物路径；平台验证状态独立记录 |
 
 `ptop.inference` 按 A 的官方 expected 审核输出。股票分批、日期分区和整批预测必须一致；真正模型预测数与 fallback 数单独记录。全缺失时间不能靠给 0 掩盖，默认排除全空输入并检查每时点真实覆盖。
@@ -91,3 +99,5 @@ C 的 Notebook 只加载模型包并读取当前 datasources 输入，返回 dat
 - 真数据诊断比较只给工程证据；正式候选须再具备官方标签验证、多 seed 稳定性、C 指标与平台长度推理通过记录。
 
 实际执行结果记录在 `b_local_experiments.md`；未执行或未获官方合同的验证不会标为通过。
+
+最终集成检查、真实 CUDA 精度对照和资源测量见 `b_verification.md`。人工目标的工程检查完成后，下一步由 A/C 提供官方 expected、映射、LabelSpec/support 与评价模块，B 在同一入口运行正式时间折和多 seed 候选比较，再交 C 做平台完整区间验证。

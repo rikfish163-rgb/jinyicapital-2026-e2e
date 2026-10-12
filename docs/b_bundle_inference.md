@@ -32,6 +32,8 @@ Qlib 的 wheel 配置可能省略许可文件，因此仓库另携带固定提�
 
 保存先完成合同检查，再在同一父目录暂存、同步文件并改名；已有 bundle 路径不能覆盖。每个训练 epoch 可使用独立目录。加载调用可信的本地模型工厂，不执行包内 Python 源码，也不会拟合处理器或安装依赖。携带源码可供审核和在预先安装依赖的环境复现；部署端自行将可信 `source` 加入 Python 模块路径。训练记录应保存运行命令、配置、数据范围和对应验证证据。
 
+`Trainer` 导出的 `training_record` 保存完整 TrainingConfig、目标配置/尺度、最佳 epoch/指标、时间折，以及 `validation_precision="fp32"`、`inference_precision="fp32"`。训练 AMP 精度与交付推理精度分开记录；不要求 C 猜测训练使用了哪种精度或超参数。精确依赖包括 Torch build 后缀，CPU 与 CUDA 环境须采用相同已安装 build。
+
 ## 训练断点
 
 ```python
@@ -67,6 +69,8 @@ generator.set_state(state.extra_state["sampler_generator"])
 `config` 和 `split` 为有限 JSON 字典。`config` 保留最大训练轮数和 scheduler 总周期等不可变信息；暂时运行到第几轮属于进程控制参数。`extra_state` 可含普通字典/list/tuple、有限标量和稠密张量，用于训练历史、目标缩放、最佳轮次和 sampler generator。NumPy 数组、任意类实例及可执行对象不允许进入断点。使用独立 generator 的 DataLoader、sampler 或目标模块须显式保存并恢复其状态；不能用全局 RNG 状态替代它们的独立状态。
 
 `restore_rng=False` 可仅恢复训练参数状态。恢复 CUDA RNG 要求相同的可见设备数；训练任务应固定设备可见性。重新构造模型前先按运行 seed 初始化，恢复调用再还原断点 RNG。
+
+上述独立 API 保存公开 RNG，不序列化 cuDNN 私有 RNN dropout 缓存。`Trainer` 另外在每个 CUDA epoch 开始重新设种子，使完整训练与 epoch 恢复使用相同 dropout 流；不要将独立 `load_checkpoint` 等同于自动恢复这个私有缓存。双层 GRU 的实际 CUDA 续训检查及其环境限制见 `b_verification.md`。
 
 ## 纯推理加载断点
 
@@ -138,9 +142,9 @@ for result in predict_bundle_partitions(
 
 ## 验证范围
 
-`tests/test_checkpoint_inference.py` 使用合成、带空股票与真实缺失分钟的官方形状样本，验证旧 v1 与全部四个 B 模型 JSON/torch 往返、文件修改拒绝、配置与依赖检查、完整模型/optimizer/scheduler/CPU AMP/随机状态恢复、下一次训练更新复现、独立 sampler 状态、微批与重排、掩码/键/时序验证、零分回退覆盖门槛、冻结处理器和分区查询惰性。真实官方标签、DAI 平台和 CUDA 的运行证据由比赛训练与部署记录另行提供。
+`tests/test_checkpoint_inference.py` 使用合成、带空股票与真实缺失分钟的官方形状样本，验证旧 v1 与全部四个 B 模型 JSON/torch 往返、文件修改拒绝、配置与依赖检查、完整模型/optimizer/scheduler/CPU AMP/随机状态恢复、下一次训练更新复现、独立 sampler 状态、微批与重排、掩码/键/时序验证、零分回退覆盖门槛、冻结处理器和分区查询惰性。最终 CUDA 和真实窗口集成证据见 [B 验证记录](b_verification.md)；真正的官方收益标签与 DAI 平台提交仍需由比赛训练及 C 的部署记录提供。
 
-2026-10-12 在 Python 3.12、Torch 2.8.0+cpu、NumPy 2.2.6、Pandas 2.2.3、PyArrow 20.0.0 和固定提交的 Qlib 0.9.8 环境，使用两个 CPU 线程运行以下三套测试：**213 passed，4 skipped**（39.56 秒）。跳过的四项是时序模型显式 opt-in 的 CUDA 测试。九个旧模型均验证 v1 精确权重往返；携带源码还在隔离工作目录的新 Python 进程中加载，确认实际导入 `source/ptop` 和 `source/jyc_e2e` 并复现 Transformer 分数。
+模型包子分支合入前，2026-10-12 在 Python 3.12、Torch 2.8.0+cpu、NumPy 2.2.6、Pandas 2.2.3、PyArrow 20.0.0 和固定提交的 Qlib 0.9.8 环境，使用两个 CPU 线程运行以下三套测试：**213 passed，4 skipped**（39.56 秒）。跳过的四项是时序模型显式 opt-in 的 CUDA 测试。九个旧模型均验证 v1 精确权重往返；携带源码还在隔离工作目录的新 Python 进程中加载，确认实际导入 `source/ptop` 和 `source/jyc_e2e` 并复现 Transformer 分数。此为子分支阶段记录，最终整套测试为 CPU269/CUDA285 passed。
 
 ```bash
 CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m pytest -q \
