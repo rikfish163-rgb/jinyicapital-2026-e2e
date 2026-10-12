@@ -2,8 +2,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
-from importlib.metadata import version
+from importlib.metadata import distribution, distributions, version
 from pathlib import Path
 
 import torch
@@ -228,6 +229,10 @@ def _validated_model_state(model, *, model_spec=None, model_name=None) -> dict:
         raise ContractError("model 必须为已构造的 torch.nn.Module")
     with torch.random.fork_rng(devices=[]):
         template = _create_spec_model(model_spec) if model_spec is not None else create_model(model_name)
+    if hasattr(template, "spec") and (
+        not hasattr(model, "spec") or _model_spec_dict(model.spec) != _model_spec_dict(template.spec)
+    ):
+        raise ContractError("模型声明的规格与保存配置不一致")
     expected = template.state_dict()
     state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     _validate_state_shapes(state, expected)
@@ -294,6 +299,73 @@ def _read_json_tensors(path: Path, expected: dict) -> dict:
 
 def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def _portable_environment() -> dict:
+    packages = {}
+    for item in distributions():
+        name = item.metadata.get("Name")
+        if isinstance(name, str) and name.strip():
+            packages[name.lower().replace("_", "-")] = item.version
+    return {"python_version": sys.version.split()[0], "packages": dict(sorted(packages.items())),
+            "qlib_commit": QLIB_COMMIT}
+
+
+def _copy_portable_source(stage: Path, manifest: dict) -> list[str]:
+    files = []
+    package_root = Path(__file__).parent.parent
+    for package in ("ptop", "jyc_e2e"):
+        directory = package_root / package
+        if not directory.is_dir():
+            raise ContractError(f"携带复现源码需要可信的 {package} 包")
+        target_directory = stage / "source" / package
+        target_directory.mkdir(parents=True)
+        for original in sorted(directory.glob("*.py")):
+            relative = f"source/{package}/{original.name}"
+            shutil.copyfile(original, stage / relative)
+            files.append(relative)
+    environment = _portable_environment()
+    _write_json(stage / "environment.json", environment)
+    files.append("environment.json")
+    lines = ["# Frozen environment snapshot. Install dependencies before using the trusted source directory."]
+    if "+cpu" in manifest["dependencies"]["torch"]:
+        lines.append("--extra-index-url https://download.pytorch.org/whl/cpu")
+    for name, installed in environment["packages"].items():
+        if name not in ("pyqlib", "jinyicapital-e2e"):
+            lines.append(f"{name}=={installed}")
+    lines.append(f"pyqlib @ git+https://github.com/microsoft/qlib.git@{QLIB_COMMIT}")
+    (stage / "requirements.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    files.append("requirements.txt")
+    third_party = package_root.parent / "THIRD_PARTY.md"
+    provenance = (third_party.read_text(encoding="utf-8") if third_party.is_file() else
+                  f"# Dependency sources\n\nQlib source: https://github.com/microsoft/qlib/tree/{QLIB_COMMIT}\n")
+    provenance += ("\n\n## Bundle dependency licenses\n\n"
+                   "The dependency LICENSE/NOTICE files below are copied verbatim from installed distribution metadata. "
+                   "Qlib is locked to the commit recorded in manifest.json and environment.json. "
+                   "Dependencies remain external installations; source/ contains this repository's ptop and jyc_e2e modules.\n")
+    for name in manifest["dependencies"]:
+        installed = distribution(name)
+        license_count = 0
+        for item in sorted(installed.files or [], key=str):
+            if (not item.name.upper().startswith(("LICENSE", "COPYING", "NOTICE"))
+                    or not any(part.endswith(".dist-info") for part in item.parts)):
+                continue
+            marker = next(index for index, part in enumerate(item.parts) if part.endswith(".dist-info"))
+            relative_parts = item.parts[marker + 1:]
+            if relative_parts and relative_parts[0] == "licenses":
+                relative_parts = relative_parts[1:]
+            relative = "/".join(("licenses", name, *relative_parts))
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(installed.locate_file(item), target)
+            files.append(relative)
+            license_count += 1
+            provenance += f"- {name} {manifest['dependencies'][name]}: `{relative}`\n"
+        if license_count == 0:
+            raise ContractError(f"无法定位 {name} 的上游许可文本；请正确安装固定依赖")
+    (stage / "THIRD_PARTY.md").write_text(provenance, encoding="utf-8")
+    files.append("THIRD_PARTY.md")
+    return files
 
 
 def _atomic_directory(path, writer) -> None:
@@ -376,20 +448,8 @@ def save_bundle(path, model, preprocessor: FrozenPreprocessor, *, model_name: st
         _write_json(stage / "preprocessor.json", processor_state)
         files = [weight_name, "preprocessor.json"]
         if portable:
-            source_directory = stage / "source" / "ptop"
-            source_directory.mkdir(parents=True)
-            for original in sorted(Path(__file__).parent.glob("*.py")):
-                relative = f"source/ptop/{original.name}"
-                shutil.copyfile(original, stage / relative)
-                manifest["source_files"].append(relative)
-                files.append(relative)
-            dependencies = manifest["dependencies"]
-            lines = ["# Install the platform's matching torch build; no download is performed by load_bundle."]
-            lines.extend(f"{name}=={dependencies[name]}" for name in ("torch", "numpy", "pandas", "pyarrow"))
-            lines.append(f"pyqlib @ git+https://github.com/microsoft/qlib.git@{QLIB_COMMIT}")
-            (stage / "requirements.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-            files.append("requirements.txt")
-            manifest["source_files"].append("requirements.txt")
+            manifest["source_files"] = _copy_portable_source(stage, manifest)
+            files.extend(manifest["source_files"])
         manifest["files"] = {name: _digest(stage / name) for name in files}
         _write_json(stage / "manifest.json", manifest)
 
@@ -440,9 +500,11 @@ def load_bundle(path):
         raise ContractError("模型包携带源码清单无效")
     for name in portable_files:
         parts = Path(name).parts
-        if name != str(Path(name)) or (name != "requirements.txt" and (
-            len(parts) != 3 or parts[:2] != ("source", "ptop") or not parts[-1].endswith(".py")
-        )):
+        code = len(parts) == 3 and parts[0] == "source" and parts[1] in ("ptop", "jyc_e2e") and parts[2].endswith(".py")
+        license_file = len(parts) >= 3 and parts[0] == "licenses" and parts[1] in manifest["dependencies"]
+        metadata_file = name in ("requirements.txt", "environment.json", "THIRD_PARTY.md")
+        if (name != str(Path(name)) or Path(name).is_absolute() or ".." in parts
+                or not (code or license_file or metadata_file)):
             raise ContractError("模型包源码路径无效")
     file_checksums = manifest["files"]
     if not isinstance(file_checksums, dict) or set(file_checksums) != {weight_name, "preprocessor.json", *portable_files}:
